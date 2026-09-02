@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Database (regenerate with: python backend/seed.py --reset)
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets
+.env
+backend/.env
+
+# Node
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/

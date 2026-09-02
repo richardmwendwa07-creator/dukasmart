@@ -1,0 +1,126 @@
+@import 'tailwindcss';
+
+/* --------------------------------------------------------------------------
+   Design tokens. One teal-forward palette, high contrast, large touch targets —
+   the operator is often on a phone, in a shop, in daylight.
+   -------------------------------------------------------------------------- */
+@theme {
+  --color-brand-50: #f0fdfa;
+  --color-brand-100: #ccfbf1;
+  --color-brand-200: #99f6e4;
+  --color-brand-300: #5eead4;
+  --color-brand-400: #2dd4bf;
+  --color-brand-500: #14b8a6;
+  --color-brand-600: #0d9488;
+  --color-brand-700: #0f766e;
+  --color-brand-800: #115e59;
+  --color-brand-900: #134e4a;
+
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  @apply bg-slate-100 text-slate-800 antialiased;
+  font-family: var(--font-sans);
+}
+
+/* Keep the bottom nav clear of the iOS home indicator. */
+.pb-safe {
+  padding-bottom: calc(0.5rem + env(safe-area-inset-bottom));
+}
+
+/* --------------------------------------------------------------------------
+   Reusable component classes.
+
+   Note for Tailwind v4: `@apply` may only reference real utilities, never
+   another custom class defined here — so each variant spells out the shared
+   base utilities in full rather than composing from a `.btn` class.
+   -------------------------------------------------------------------------- */
+@layer components {
+  .card {
+    @apply rounded-2xl bg-white shadow-sm ring-1 ring-slate-200;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold
+           transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold
+           transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           disabled:cursor-not-allowed disabled:opacity-50
+           bg-brand-700 text-white hover:bg-brand-800 focus-visible:ring-brand-600;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold
+           transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           disabled:cursor-not-allowed disabled:opacity-50
+           bg-white text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50 focus-visible:ring-slate-400;
+  }
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold
+           transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           disabled:cursor-not-allowed disabled:opacity-50
+           bg-rose-600 text-white hover:bg-rose-700 focus-visible:ring-rose-500;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold
+           transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           disabled:cursor-not-allowed disabled:opacity-50
+           text-slate-600 hover:bg-slate-100 focus-visible:ring-slate-400;
+  }
+
+  .input {
+    @apply w-full rounded-xl border-0 bg-white px-3.5 py-2.5 text-base text-slate-900
+           ring-1 ring-slate-300 placeholder:text-slate-400
+           focus:ring-2 focus:ring-brand-600 focus:outline-none;
+  }
+  .label {
+    @apply mb-1.5 block text-sm font-medium text-slate-700;
+  }
+  .hint {
+    @apply mt-1 text-xs text-slate-500;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold;
+  }
+  .badge-danger {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold
+           bg-rose-100 text-rose-800;
+  }
+  .badge-warn {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold
+           bg-amber-100 text-amber-800;
+  }
+  .badge-ok {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold
+           bg-emerald-100 text-emerald-800;
+  }
+  .badge-muted {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold
+           bg-slate-100 text-slate-600;
+  }
+  .badge-info {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold
+           bg-sky-100 text-sky-800;
+  }
+
+  .th {
+    @apply px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500;
+  }
+  .td {
+    @apply px-4 py-3 text-sm text-slate-700;
+  }
+}
+
+/* Slim scrollbars on the horizontal table wrappers. */
+.scroll-x {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
