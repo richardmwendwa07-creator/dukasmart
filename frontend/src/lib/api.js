@@ -6,7 +6,7 @@
  */
 
 const TOKEN_KEY = 'dukasmart.token'
-
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '')
 export function getToken() {
   try {
     return localStorage.getItem(TOKEN_KEY)
@@ -41,7 +41,7 @@ async function request(path, { method = 'GET', body, signal } = {}) {
 
   let response
   try {
-    response = await fetch(path, {
+    response = await fetch(`${API_BASE}${path}`, {
       method,
       headers,
       signal,
