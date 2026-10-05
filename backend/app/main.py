@@ -30,6 +30,26 @@ logger = logging.getLogger("dukasmart")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+
+    # Auto-seed demo data on first startup. The seed script is idempotent:
+    # it checks for existing users and skips if the database is already
+    # populated. This ensures a fresh Render container (whose SQLite file
+    # is discarded on each restart) always comes back with demo data.
+    from .database import SessionLocal
+    from .models import User
+    _db = SessionLocal()
+    try:
+        if _db.query(User).count() == 0:
+            logger.info("Database is empty - running seed script")
+            try:
+                from seed import seed as run_seed
+                run_seed()
+                logger.info("Seed completed successfully")
+            except Exception as exc:
+                logger.error("Auto-seed failed: %s", exc)
+    finally:
+        _db.close()
+
     logger.info("DukaSmart API ready (database: %s)", settings.database_url.split("///")[-1])
     yield
 
