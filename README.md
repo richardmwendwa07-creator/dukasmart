@@ -46,7 +46,7 @@ cd backend && python -m pytest -q      # 48 passing
 | **Stock** | Derived from an append-only movement trail (`SUM(change_qty)`), never a mutable counter. Every sale, delivery, and correction is auditable per product. |
 | **Forecasting** | Three models compete per product on a time-ordered hold-out — weighted moving average, exponential smoothing, and gradient boosting over lag/rolling/calendar features. Lowest MAE wins. |
 | **Honesty gate** | Products with fewer than 10 selling days or 28 days of history are flagged `insufficient_data` rather than guessed at. |
-| **Restock plan** | Ranks at-risk products by `0.50 × stockout risk + 0.30 × demand velocity + 0.20 × cost efficiency`, then allocates the budget top-down, showing the shortfall. |
+| **Restock plan** | Ranks at-risk products by `0.40 × stockout risk + 0.30 × forecast demand + 0.20 × expected gross profit + 0.10 × affordability`, then allocates the budget top-down, showing the shortfall. |
 | **Human in the loop** | Accept / change / reject each line. Accepting never moves stock. |
 | **Reports** | Sales, deliveries, forecast accuracy (predicted vs. actual), and plans vs. what was actually bought. |
 

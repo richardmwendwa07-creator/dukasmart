@@ -50,11 +50,12 @@ class Settings(BaseSettings):
     # Safety margin applied on top of forecast (+ lead-time) demand, as a fraction.
     default_safety_margin_pct: float = 0.20
 
-    # --- priority score weights (documented in docs/README.md) -----------
+        # --- priority score weights (documented in docs/README.md) -----------
     # Must sum to 1.0; validated at import time below.
-    weight_stockout_risk: float = 0.50
-    weight_demand_velocity: float = 0.30
-    weight_cost_efficiency: float = 0.20
+    weight_stockout_risk: float = 0.40
+    weight_forecast_demand: float = 0.30
+    weight_expected_gross_profit: float = 0.20
+    weight_affordability: float = 0.10
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -69,8 +70,9 @@ settings = Settings()
 
 _weight_sum = (
     settings.weight_stockout_risk
-    + settings.weight_demand_velocity
-    + settings.weight_cost_efficiency
+    + settings.weight_forecast_demand
+    + settings.weight_expected_gross_profit
+    + settings.weight_affordability
 )
 if abs(_weight_sum - 1.0) > 1e-6:  # pragma: no cover - configuration guard
     raise ValueError(

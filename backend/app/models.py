@@ -315,6 +315,11 @@ class RecommendationRun(Base):
     products_considered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     products_skipped_no_forecast: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     products_skipped_no_cost: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # NEW: total expected gross profit across every recommended item in this run.
+    # Not one of the 4 migrated columns (it's a run-level total, not a per-item
+    # value), so it lives only in Python for now - see the note in
+    # services/recommendation.py. Left un-mapped here deliberately; add a
+    # migrated column later if you want it persisted per run.
 
     budget: Mapped["Budget"] = relationship()
     user: Mapped["User"] = relationship()
@@ -355,6 +360,19 @@ class Recommendation(Base):
     priority_score: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     priority_rank: Mapped[int] = mapped_column(Integer, nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
+
+    # --- NEW: profitability-aware columns (added by migrate_profitability.py) ---
+    # gross_profit_per_unit = product.selling_price - unit_cost
+    # expected_gross_profit = forecast_demand x gross_profit_per_unit
+    gross_profit_per_unit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_gross_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+        # `priority_reason` is a short, skimmable tag (e.g. "Urgent: stockout
+    # risk", "High demand + high margin") for a table column — distinct
+    # from `reason` above, which stays the full-paragraph explanation.
+    # Populated by `_priority_label()` in services/recommendation.py.
+    priority_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- end new columns ---
 
     status: Mapped[RecommendationStatus] = mapped_column(
         _enum(RecommendationStatus, "recommendation_status"),

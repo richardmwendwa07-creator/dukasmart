@@ -16,24 +16,40 @@ the safety margin) exceeds what is on the shelf today.
 --------------------------------------------------------------------------
 Priority score (only matters when the budget cannot cover everything)
 --------------------------------------------------------------------------
-Three normalised 0-1 factors, combined with explicit weights:
+UPDATED: four normalised 0-1 factors, combined with explicit weights:
 
-    priority = 0.50 x stockout_risk
-             + 0.30 x demand_velocity
-             + 0.20 x cost_efficiency
+    priority = 0.40 x stockout_risk
+             + 0.30 x normalised_forecast_demand
+             + 0.20 x normalised_expected_gross_profit
+             + 0.10 x normalised_affordability
 
-* ``stockout_risk``   = shortage / projected_need. "What fraction of what I need
-  am I missing?" 1.0 = shelf is empty, 0.1 = a small top-up. Weighted highest
-  because running out is the failure the shop feels most directly.
-* ``demand_velocity`` = daily_rate, min-max normalised across the at-risk set.
-  Fast movers earn their shelf space back sooner, so they are restocked first.
-* ``cost_efficiency`` = gross margin per shilling spent,
-  ``(selling_price - unit_cost) / unit_cost``, min-max normalised. Rewards
-  products that turn a limited budget into the most profit. Falls back to
-  ``1 / unit_cost`` (cheap-first) if no product has a recorded margin.
+* ``stockout_risk``   = shortage / projected_need, used AS-IS (not min-max
+  re-scaled across the batch). This ratio already means something on its own
+  - "what fraction of what I need am I missing" - and min-maxing it across
+  whichever products happen to be in this run would distort that meaning
+  (e.g. if every candidate this run is badly short, min-max would flatten
+  that into "half urgent, half not", which is wrong).
+* ``forecast_demand`` = the product's forecast_demand for this run, min-max
+  normalised across all candidates. (Equivalent in ranking terms to
+  normalising daily_rate, since every candidate in a run shares the same
+  horizon_days - but this matches the spec's wording directly.)
+* ``expected_gross_profit`` = forecast_demand x (selling_price - unit_cost),
+  min-max normalised across all candidates.
+* ``affordability`` = 1 / (1 + required_cost), where required_cost is what
+  it would cost to fully cover this product's shortage. Min-max normalised
+  across all candidates, same as the other three factors.
 
-Weights are configurable via ``DUKASMART_WEIGHT_*`` and are stored on every run
-so an old recommendation can always be explained.
+``cost_efficiency_score`` (margin per shilling spent) is still computed and
+stored on every recommendation, since other parts of the app may read it -
+it just no longer feeds priority_score directly.
+
+Weights are configurable via settings.weight_stockout_risk,
+settings.weight_forecast_demand, settings.weight_expected_gross_profit and
+settings.weight_affordability (env vars DUKASMART_WEIGHT_STOCKOUT_RISK,
+DUKASMART_WEIGHT_FORECAST_DEMAND, DUKASMART_WEIGHT_EXPECTED_GROSS_PROFIT,
+DUKASMART_WEIGHT_AFFORDABILITY), validated at import time in config.py to
+sum to 1.0. Every run stores the weights it used in weights_used, so an old
+recommendation stays explainable even after the weights change.
 
 --------------------------------------------------------------------------
 Budget allocation
@@ -46,6 +62,11 @@ product cannot be afforded at all we keep walking - a cheaper item further down
 may still fit. This is a greedy allocation, chosen because it is explainable to
 a shop owner; an optimal knapsack solve would buy marginally more units but
 could not be justified line-by-line.
+
+UNCHANGED by this update. The "total expected gross profit of the basket" is
+computed from what's actually allocated (gross_profit_per_unit x
+recommended_quantity for each line, summed), not from full forecast demand -
+so a partially-funded product only contributes its partial share.
 """
 
 from __future__ import annotations
@@ -234,6 +255,49 @@ def _normalise(values: list[float]) -> list[float]:
 
 
 # --------------------------------------------------------------------------
+# NEW: short, skimmable "what drove this ranking" label
+# --------------------------------------------------------------------------
+def _priority_label(
+    *,
+    risk: float,
+    demand: float,
+    profit: float,
+    affordability: float,
+    weight_stockout_risk: float,
+    weight_forecast_demand: float,
+    weight_expected_gross_profit: float,
+    weight_affordability: float,
+) -> str:
+    """One-line tag for a table column, e.g. 'High demand + high margin' or
+    'Urgent: stockout risk'. Distinct from `reason`, which stays a full
+    paragraph - this is meant to be skimmed at a glance.
+    """
+    if risk >= 0.8:
+        # A near-empty shelf dominates how this line should read, regardless
+        # of the other three factors' weighted contribution.
+        return "Urgent: stockout risk"
+
+    contributions = {
+        "stockout risk": weight_stockout_risk * risk,
+        "high demand": weight_forecast_demand * demand,
+        "high margin": weight_expected_gross_profit * profit,
+        "affordability": weight_affordability * affordability,
+    }
+    ranked = sorted(contributions.items(), key=lambda kv: kv[1], reverse=True)
+    top_name, top_value = ranked[0]
+    second_name, second_value = ranked[1]
+
+    if top_value <= 0:
+        return "Balanced priority"
+
+    if second_value > 0 and second_value >= top_value * 0.6:
+        # Two factors are close enough that both deserve credit.
+        return f"{top_name.capitalize()} + {second_name}"
+
+    return top_name.capitalize()
+
+
+# --------------------------------------------------------------------------
 # The recommendation run
 # --------------------------------------------------------------------------
 def generate_recommendation_run(
@@ -294,6 +358,11 @@ def generate_recommendation_run(
                 skipped_no_cost += 1
                 continue
 
+            # --- NEW: profitability figures, computed once per candidate ---
+            gross_profit_per_unit = float(product.selling_price) - unit_cost
+            expected_gross_profit = demand * gross_profit_per_unit
+            # --- end new ---
+
             candidates.append(
                 {
                     "product": product,
@@ -301,6 +370,8 @@ def generate_recommendation_run(
                     "current_stock": on_hand,
                     "forecast_demand": demand,
                     "unit_cost": unit_cost,
+                    "gross_profit_per_unit": gross_profit_per_unit,
+                    "expected_gross_profit": expected_gross_profit,
                     **profile,
                 }
             )
@@ -319,18 +390,50 @@ def generate_recommendation_run(
             velocity_scores = _normalise(velocities)
             cost_scores = _normalise(margins)
 
-            for c, vel, ce in zip(candidates, velocity_scores, cost_scores, strict=True):
+            # --- NEW: the four factors that actually feed priority_score now ---
+            demand_scores = _normalise([c["forecast_demand"] for c in candidates])
+            profit_scores = _normalise([c["expected_gross_profit"] for c in candidates])
+            required_costs = [c["shortage"] * c["unit_cost"] for c in candidates]
+            affordability_raw = [1.0 / (1.0 + rc) for rc in required_costs]
+            affordability_scores = _normalise(affordability_raw)
+            # --- end new ---
+
+            for c, vel, ce, dem, prof, afford in zip(
+                candidates,
+                velocity_scores,
+                cost_scores,
+                demand_scores,
+                profit_scores,
+                affordability_scores,
+                strict=True,
+            ):
                 risk = (
                     min(1.0, c["shortage"] / c["projected_need"]) if c["projected_need"] > 0 else 0.0
                 )
                 c["stockout_risk_score"] = risk
                 c["demand_velocity_score"] = vel
+                # Still computed and stored for backward compatibility / other
+                # reports, but no longer part of priority_score below.
                 c["cost_efficiency_score"] = ce
+
+                # --- NEW: the updated 4-factor weighted priority score ---
                 c["priority_score"] = (
                     settings.weight_stockout_risk * risk
-                    + settings.weight_demand_velocity * vel
-                    + settings.weight_cost_efficiency * ce
+                    + settings.weight_forecast_demand * dem
+                    + settings.weight_expected_gross_profit * prof
+                    + settings.weight_affordability * afford
                 )
+                c["priority_label"] = _priority_label(
+                    risk=risk,
+                    demand=dem,
+                    profit=prof,
+                    affordability=afford,
+                    weight_stockout_risk=settings.weight_stockout_risk,
+                    weight_forecast_demand=settings.weight_forecast_demand,
+                    weight_expected_gross_profit=settings.weight_expected_gross_profit,
+                    weight_affordability=settings.weight_affordability,
+                )
+                # --- end new ---
 
             # Highest priority first; cheaper line wins a tie so the budget stretches.
             candidates.sort(
@@ -353,8 +456,9 @@ def generate_recommendation_run(
             weights_used=json.dumps(
                 {
                     "stockout_risk": settings.weight_stockout_risk,
-                    "demand_velocity": settings.weight_demand_velocity,
-                    "cost_efficiency": settings.weight_cost_efficiency,
+                    "forecast_demand": settings.weight_forecast_demand,
+                    "expected_gross_profit": settings.weight_expected_gross_profit,
+                    "affordability": settings.weight_affordability,
                 }
             ),
             products_considered=len(candidates),
@@ -404,18 +508,38 @@ def generate_recommendation_run(
                     priority_score=round(c["priority_score"], 4),
                     priority_rank=rank,
                     reason=_explain(c, required_qty, allocated_qty, rank, constrained),
+                    # --- NEW: profitability-aware columns ---
+                    gross_profit_per_unit=round(c["gross_profit_per_unit"], 2),
+                    expected_gross_profit=round(c["expected_gross_profit"], 2),
+                    priority_reason=c["priority_label"],
+                    # --- end new ---
                     status=RecommendationStatus.proposed,
                 )
             )
 
         run.total_recommended_cost = round(total_allocated, 2)
+        # NOTE: total_expected_gross_profit is intentionally NOT set here as a
+        # Python attribute. An earlier draft did that, but it only survives
+        # for a run fetched in the same request/session it was generated in -
+        # any later fetch (list_runs, latest_run, get_run in planning.py)
+        # would silently see 0 instead of the real total. Since
+        # gross_profit_per_unit and recommended_quantity are both persisted
+        # columns on every Recommendation row, the router derives this total
+        # from the database instead (see _run_out in routers/planning.py),
+        # which works correctly for every run, old or new.
         db.flush()
 
     return run
 
 
 def _explain(c: dict, required_qty: int, allocated_qty: int, rank: int, constrained: bool) -> str:
-    """Plain-language 'why this line' text shown next to every recommendation."""
+    """Plain-language 'why this line' text shown next to every recommendation.
+
+    Unchanged by the profitability update - this stays the detailed
+    paragraph it always was. The new short priority label lives in
+    `priority_reason` instead (see `_priority_label` above), so nothing here
+    needed to change.
+    """
     product = c["product"]
     horizon = c["forecast"].horizon_days
     parts = [

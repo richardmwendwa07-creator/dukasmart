@@ -1,0 +1,17 @@
+product_id,sku,name,sufficiency,method_chosen,mae,mape,predicted,wma_mae,ses_mae,gbm_mae,n_obs
+1,MF2KG,Maize Flour 2kg,sufficient,weighted_moving_average,0.0,,0.0,0.0,0.0008,0.0135,127
+2,OIL1L,Cooking Oil 1L,sufficient,weighted_moving_average,0.114,,0.0,0.1143,0.1492,0.2507,127
+3,SUG1KG,Sugar 1kg,sufficient,weighted_moving_average,0.214,,6.0,0.2143,0.2401,0.3375,127
+4,RIC1KG,Rice 1kg,sufficient,weighted_moving_average,0.0,,0.0,0.0,0.0158,0.0807,127
+5,BRD400,Bread 400g,sufficient,weighted_moving_average,1.471,,3.14,1.4714,1.641,2.1191,127
+6,MLK500,Fresh Milk 500ml,sufficient,gradient_boosting,0.119,,2.84,0.2286,0.2934,0.1195,127
+7,EGG30,Eggs (tray of 30),sufficient,weighted_moving_average,0.0,,0.0,0.0,0.0945,0.0467,127
+8,TEA250,Tea Leaves 250g,sufficient,weighted_moving_average,0.0,,0.0,0.0,0.1762,0.3447,127
+9,SOD500,Soda 500ml,sufficient,weighted_moving_average,0.0,,0.0,0.0,0.0709,0.0162,127
+10,WTR1L,Bottled Water 1L,sufficient,weighted_moving_average,0.429,,1.71,0.4286,0.4844,0.5609,127
+11,SOAPBR,Laundry Soap Bar,sufficient,weighted_moving_average,0.357,,10.0,0.3571,0.4031,0.5003,127
+12,WSH500,Washing Powder 500g,sufficient,weighted_moving_average,0.371,,0.0,0.3714,0.5204,0.9307,127
+13,SLT1KG,Salt 1kg,sufficient,weighted_moving_average,0.0,,0.0,0.0,0.1829,0.6017,127
+14,MTCH10,Matches (pack of 10),sufficient,weighted_moving_average,0.0,,0.0,0.0,0.0526,0.4074,127
+15,COC400,Cocoa Drink 400g,insufficient_data,,,,,,,,69
+16,SHP50,Shoe Polish 50ml,insufficient_data,,,,,,,,120

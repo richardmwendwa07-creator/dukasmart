@@ -1,0 +1,2118 @@
+
+===== backend\app\models.py =====
+
+"""SQLAlchemy models for DukaSmart.
+
+Design notes
+------------
+* Money is stored as ``NUMERIC(12, 2)`` but surfaced to Python as ``float``
+  (``asdecimal=False``) to keep the pandas/JSON layers simple. A production
+  system handling real cash should switch to ``Decimal``.
+* Quantities are whole units (packets, bottles, tins). See docs/README.md.
+* ``InventoryMovement`` is the single source of truth for stock. Products
+  deliberately have **no** mutable ``stock`` column: current stock is derived by
+  summing movements (see ``services.inventory.current_stock``).
+"""
+
+from __future__ import annotations
+
+import enum
+from datetime import date, datetime, timezone
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    Date,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .database import Base
+
+Money = Numeric(12, 2, asdecimal=False)
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# Enumerations
+# --------------------------------------------------------------------------
+class UserRole(str, enum.Enum):
+    owner = "owner"
+    staff = "staff"
+
+
+class MovementSource(str, enum.Enum):
+    sale = "sale"
+    purchase = "purchase"
+    adjustment = "adjustment"
+
+
+class DataSufficiency(str, enum.Enum):
+    sufficient = "sufficient"
+    insufficient_data = "insufficient_data"
+
+
+class RecommendationStatus(str, enum.Enum):
+    proposed = "proposed"
+    accepted = "accepted"
+    modified = "modified"
+    rejected = "rejected"
+
+
+def _enum(py_enum, name):
+    """Store enums as plain VARCHAR + CHECK so SQLite/Postgres behave alike."""
+    return Enum(py_enum, name=name, native_enum=False, values_callable=lambda e: [m.value for m in e])
+
+
+# --------------------------------------------------------------------------
+# Association: a product may be sourced from several suppliers
+# --------------------------------------------------------------------------
+product_suppliers = Table(
+    "product_suppliers",
+    Base.metadata,
+    Column("product_id", ForeignKey("products.id", ondelete="CASCADE"), primary_key=True),
+    Column("supplier_id", ForeignKey("suppliers.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
+# --------------------------------------------------------------------------
+# Core entities
+# --------------------------------------------------------------------------
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[UserRole] = mapped_column(
+        _enum(UserRole, "user_role"), nullable=False, default=UserRole.staff
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    sales: Mapped[list["Sale"]] = relationship(back_populates="user")
+    purchases: Mapped[list["Purchase"]] = relationship(back_populates="user")
+    budgets: Mapped[list["Budget"]] = relationship(back_populates="user")
+
+
+class Supplier(Base):
+    __tablename__ = "suppliers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    contact: Mapped[str | None] = mapped_column(String(160))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    products: Mapped[list["Product"]] = relationship(
+        secondary=product_suppliers, back_populates="suppliers"
+    )
+    purchases: Mapped[list["Purchase"]] = relationship(back_populates="supplier")
+
+
+class Product(Base):
+    __tablename__ = "products"
+    __table_args__ = (
+        CheckConstraint("selling_price >= 0", name="ck_product_selling_price_non_negative"),
+        CheckConstraint("default_unit_cost >= 0", name="ck_product_unit_cost_non_negative"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
+    category: Mapped[str | None] = mapped_column(String(80), index=True)
+    sku: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    selling_price: Mapped[float] = mapped_column(Money, nullable=False)
+    # Fallback purchase cost. The recommendation engine prefers the most recent
+    # actual PurchaseItem cost when one exists (see services/recommendation.py).
+    default_unit_cost: Mapped[float] = mapped_column(Money, nullable=False, default=0)
+    reorder_lead_time_days: Mapped[int | None] = mapped_column(Integer)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    preferred_supplier_id: Mapped[int | None] = mapped_column(
+        ForeignKey("suppliers.id", ondelete="SET NULL")
+    )
+    preferred_supplier: Mapped["Supplier | None"] = relationship(foreign_keys=[preferred_supplier_id])
+
+    suppliers: Mapped[list["Supplier"]] = relationship(
+        secondary=product_suppliers, back_populates="products"
+    )
+    movements: Mapped[list["InventoryMovement"]] = relationship(
+        back_populates="product", cascade="all, delete-orphan"
+    )
+
+
+class Sale(Base):
+    __tablename__ = "sales"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    total_amount: Mapped[float] = mapped_column(Money, nullable=False, default=0)
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    user: Mapped["User"] = relationship(back_populates="sales")
+    items: Mapped[list["SaleItem"]] = relationship(
+        back_populates="sale", cascade="all, delete-orphan"
+    )
+
+
+class SaleItem(Base):
+    __tablename__ = "sale_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_sale_item_qty_positive"),
+        CheckConstraint("unit_price_at_sale >= 0", name="ck_sale_item_price_non_negative"),
+        Index("ix_sale_items_product", "product_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sale_id: Mapped[int] = mapped_column(ForeignKey("sales.id", ondelete="CASCADE"), nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_price_at_sale: Mapped[float] = mapped_column(Money, nullable=False)
+
+    sale: Mapped["Sale"] = relationship(back_populates="items")
+    product: Mapped["Product"] = relationship()
+
+
+class Purchase(Base):
+    __tablename__ = "purchases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), nullable=False)
+    date_received: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    total_cost: Mapped[float] = mapped_column(Money, nullable=False, default=0)
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    user: Mapped["User"] = relationship(back_populates="purchases")
+    supplier: Mapped["Supplier"] = relationship(back_populates="purchases")
+    items: Mapped[list["PurchaseItem"]] = relationship(
+        back_populates="purchase", cascade="all, delete-orphan"
+    )
+
+
+class PurchaseItem(Base):
+    __tablename__ = "purchase_items"
+    __table_args__ = (
+        CheckConstraint("quantity_received > 0", name="ck_purchase_item_qty_positive"),
+        CheckConstraint("unit_cost >= 0", name="ck_purchase_item_cost_non_negative"),
+        Index("ix_purchase_items_product", "product_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    purchase_id: Mapped[int] = mapped_column(
+        ForeignKey("purchases.id", ondelete="CASCADE"), nullable=False
+    )
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
+    quantity_received: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_cost: Mapped[float] = mapped_column(Money, nullable=False)
+
+    purchase: Mapped["Purchase"] = relationship(back_populates="items")
+    product: Mapped["Product"] = relationship()
+
+
+class InventoryMovement(Base):
+    """Append-only audit trail. Current stock == SUM(change_qty) per product."""
+
+    __tablename__ = "inventory_movements"
+    __table_args__ = (
+        CheckConstraint("change_qty <> 0", name="ck_movement_qty_nonzero"),
+        Index("ix_movements_product_time", "product_id", "timestamp"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    change_qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_type: Mapped[MovementSource] = mapped_column(
+        _enum(MovementSource, "movement_source"), nullable=False
+    )
+    source_id: Mapped[int | None] = mapped_column(Integer)
+    resulting_stock: Mapped[int] = mapped_column(Integer, nullable=False)
+    note: Mapped[str | None] = mapped_column(String(255))
+    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow, index=True)
+
+    product: Mapped["Product"] = relationship(back_populates="movements")
+
+
+class Forecast(Base):
+    __tablename__ = "forecasts"
+    __table_args__ = (Index("ix_forecasts_product_time", "product_id", "generated_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    generated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    predicted_quantity: Mapped[float | None] = mapped_column(Float)
+    model_used: Mapped[str | None] = mapped_column(String(60))
+    # JSON blobs kept as TEXT so the same code runs on SQLite and Postgres.
+    model_params: Mapped[str | None] = mapped_column(Text)
+    error_metrics: Mapped[str | None] = mapped_column(Text)
+    mae: Mapped[float | None] = mapped_column(Float)
+    mape: Mapped[float | None] = mapped_column(Float)
+    data_sufficiency_flag: Mapped[DataSufficiency] = mapped_column(
+        _enum(DataSufficiency, "data_sufficiency"), nullable=False
+    )
+    insufficiency_reason: Mapped[str | None] = mapped_column(String(255))
+
+    # --- reproducibility: exactly which data went in ---------------------
+    bucket: Mapped[str] = mapped_column(String(10), nullable=False, default="daily")
+    data_window_start: Mapped[date | None] = mapped_column(Date)
+    data_window_end: Mapped[date | None] = mapped_column(Date)
+    observations_used: Mapped[int | None] = mapped_column(Integer)
+    nonzero_observations: Mapped[int | None] = mapped_column(Integer)
+    candidate_scores: Mapped[str | None] = mapped_column(Text)
+
+    product: Mapped["Product"] = relationship()
+
+
+class Budget(Base):
+    __tablename__ = "budgets"
+    __table_args__ = (CheckConstraint("amount_available >= 0", name="ck_budget_non_negative"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    period: Mapped[str] = mapped_column(String(40), nullable=False)  # e.g. "2026-08" or "Week 34"
+    amount_available: Mapped[float] = mapped_column(Money, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    user: Mapped["User"] = relationship(back_populates="budgets")
+
+
+class RecommendationRun(Base):
+    """Groups the line items produced by one 'what should I buy?' run."""
+
+    __tablename__ = "recommendation_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    budget_id: Mapped[int] = mapped_column(ForeignKey("budgets.id"), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    safety_margin_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    budget_amount: Mapped[float] = mapped_column(Money, nullable=False)
+    total_required_cost: Mapped[float] = mapped_column(Money, nullable=False, default=0)
+    total_recommended_cost: Mapped[float] = mapped_column(Money, nullable=False, default=0)
+    budget_constrained: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    weights_used: Mapped[str | None] = mapped_column(Text)
+    products_considered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    products_skipped_no_forecast: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    products_skipped_no_cost: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # NEW: total expected gross profit across every recommended item in this run.
+    # Not one of the 4 migrated columns (it's a run-level total, not a per-item
+    # value), so it lives only in Python for now - see the note in
+    # services/recommendation.py. Left un-mapped here deliberately; add a
+    # migrated column later if you want it persisted per run.
+
+    budget: Mapped["Budget"] = relationship()
+    user: Mapped["User"] = relationship()
+    items: Mapped[list["Recommendation"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class Recommendation(Base):
+    __tablename__ = "recommendations"
+    __table_args__ = (
+        UniqueConstraint("run_id", "product_id", name="uq_recommendation_run_product"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("recommendation_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    generated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
+    forecast_id: Mapped[int | None] = mapped_column(ForeignKey("forecasts.id"))
+
+    current_stock: Mapped[int] = mapped_column(Integer, nullable=False)
+    forecast_demand: Mapped[float] = mapped_column(Float, nullable=False)
+    safety_stock: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    lead_time_demand: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    estimated_shortage: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_cost: Mapped[float] = mapped_column(Money, nullable=False)
+    required_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    required_cost: Mapped[float] = mapped_column(Money, nullable=False)
+    recommended_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    recommended_cost: Mapped[float] = mapped_column(Money, nullable=False)
+
+    # Transparent scoring inputs, persisted so the operator can be shown "why".
+    stockout_risk_score: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    demand_velocity_score: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    cost_efficiency_score: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    priority_score: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    priority_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+
+    # --- NEW: profitability-aware columns (added by migrate_profitability.py) ---
+    # gross_profit_per_unit = product.selling_price - unit_cost
+    # expected_gross_profit = forecast_demand x gross_profit_per_unit
+    gross_profit_per_unit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_gross_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+        # `priority_reason` is a short, skimmable tag (e.g. "Urgent: stockout
+    # risk", "High demand + high margin") for a table column — distinct
+    # from `reason` above, which stays the full-paragraph explanation.
+    # Populated by `_priority_label()` in services/recommendation.py.
+    priority_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- end new columns ---
+
+    status: Mapped[RecommendationStatus] = mapped_column(
+        _enum(RecommendationStatus, "recommendation_status"),
+        nullable=False,
+        default=RecommendationStatus.proposed,
+    )
+    operator_quantity: Mapped[int | None] = mapped_column(Integer)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    run: Mapped["RecommendationRun"] = relationship(back_populates="items")
+    product: Mapped["Product"] = relationship()
+    forecast: Mapped["Forecast | None"] = relationship()
+
+
+===== backend\app\security.py =====
+
+"""Password hashing and JWT issuance.
+
+Passwords are hashed with bcrypt and never stored, logged, or returned.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import bcrypt
+import jwt
+
+from .config import settings
+
+# bcrypt truncates at 72 bytes; reject longer input explicitly rather than
+# silently ignoring the tail (which would make two different passwords equal).
+MAX_PASSWORD_BYTES = 72
+MIN_PASSWORD_LENGTH = 8
+
+
+class PasswordPolicyError(ValueError):
+    pass
+
+
+def validate_password(password: str) -> None:
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise PasswordPolicyError(
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
+        )
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        raise PasswordPolicyError(
+            f"Password must be at most {MAX_PASSWORD_BYTES} bytes long."
+        )
+
+
+def hash_password(password: str) -> str:
+    validate_password(password)
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        # Malformed stored hash — treat as a failed login, never as success.
+        return False
+
+
+def create_access_token(subject: str | int, role: str) -> tuple[str, int]:
+    expires_in = settings.access_token_expire_minutes * 60
+    now = datetime.now(timezone.utc)
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=expires_in)).timestamp()),
+    }
+    token = jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
+    return token, expires_in
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    return jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+
+
+===== backend\app\config.py =====
+
+"""Application settings.
+
+Everything tunable lives here so the forecasting / recommendation behaviour can be
+adjusted without touching business logic. Values can be overridden with environment
+variables (prefix ``DUKASMART_``) or a ``.env`` file next to the backend folder.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="DUKASMART_",
+        env_file=str(BACKEND_DIR / ".env"),
+        extra="ignore",
+    )
+
+    # --- infrastructure -------------------------------------------------
+    app_name: str = "DukaSmart"
+    database_url: str = f"sqlite:///{(BACKEND_DIR / 'dukasmart.db').as_posix()}"
+    # NOTE: for a real deployment this MUST be supplied via the environment.
+    secret_key: str = "dev-only-change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60 * 12
+    # "*" for local/dev use — safe here because auth uses a Bearer token, not
+    # cookies, so allow_credentials stays False and a wildcard origin is fine.
+    cors_origins: str = "*"
+
+    # --- forecasting ----------------------------------------------------
+    # A product needs at least this many days with a non-zero sale before we are
+    # willing to forecast it. Below this we return `insufficient_data` instead of
+    # inventing a number (spec 4.6).
+    min_nonzero_observations: int = 10
+    # ...and the sales history must span at least this many calendar days.
+    min_history_days: int = 28
+    # Size of the time-ordered hold-out window used to score competing models.
+    holdout_days: int = 14
+    # Default forecast horizon when the caller does not specify one.
+    default_horizon_days: int = 14
+    # Horizons the UI offers.
+    allowed_horizons: str = "7,14,30"
+
+    # --- replenishment --------------------------------------------------
+    # Safety margin applied on top of forecast (+ lead-time) demand, as a fraction.
+    default_safety_margin_pct: float = 0.20
+
+        # --- priority score weights (documented in docs/README.md) -----------
+    # Must sum to 1.0; validated at import time below.
+    weight_stockout_risk: float = 0.40
+    weight_forecast_demand: float = 0.30
+    weight_expected_gross_profit: float = 0.20
+    weight_affordability: float = 0.10
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def allowed_horizon_list(self) -> list[int]:
+        return [int(h.strip()) for h in self.allowed_horizons.split(",") if h.strip()]
+
+
+settings = Settings()
+
+_weight_sum = (
+    settings.weight_stockout_risk
+    + settings.weight_forecast_demand
+    + settings.weight_expected_gross_profit
+    + settings.weight_affordability
+)
+if abs(_weight_sum - 1.0) > 1e-6:  # pragma: no cover - configuration guard
+    raise ValueError(
+        f"Priority score weights must sum to 1.0, got {_weight_sum:.4f}. "
+        "Check DUKASMART_WEIGHT_* settings."
+    )
+
+
+===== backend\app\services\forecasting.py =====
+
+"""Demand forecasting engine.
+
+Approach (see docs/README.md for the narrative version)
+-------------------------------------------------------
+1. Build a **dense** daily demand series per product: every calendar day from the
+   product's first recorded sale to "today" gets a row, with 0 on days nothing
+   sold. Dense-with-zeros matters — sparse series make a slow seller look like a
+   fast one.
+2. **Data-sufficiency gate.** A product must have at least
+   ``min_nonzero_observations`` days with a sale AND at least
+   ``min_history_days`` of span. Otherwise we return ``insufficient_data`` and
+   forecast nothing. Guessing from three data points would be worse than silence.
+3. **Time-ordered hold-out.** The last ``holdout_days`` become the test window;
+   everything before is training. Never a random split — that leaks the future
+   into the past and flatters the model.
+4. **Model bake-off.** Three candidates compete on the same hold-out:
+     * ``weighted_moving_average`` - baseline, recent days weighted highest
+     * ``simple_exponential_smoothing`` - baseline, statsmodels SES
+     * ``gradient_boosting`` - scikit-learn HistGradientBoostingRegressor over
+       lag / rolling / calendar features, forecast recursively
+   Lowest hold-out MAE wins. Ties break toward the simpler model.
+5. **Refit + forecast.** The winner is refit on the *full* history and used to
+   predict each day of the horizon; ``predicted_quantity`` is the sum.
+6. Everything needed to re-run the forecast (model name, parameters, data window,
+   observation counts, every candidate's score) is persisted on the Forecast row.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import warnings
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..config import settings
+from ..models import DataSufficiency, Forecast, Product, Sale, SaleItem
+
+# statsmodels is chatty about short series; we handle the failure cases ourselves.
+warnings.filterwarnings("ignore", category=UserWarning, module="statsmodels")
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# MAPE is meaningless when the actual value is ~0 (division blows up), so we only
+# average percentage error over days where at least this many units sold.
+MAPE_MIN_ACTUAL = 1.0
+MAPE_MIN_POINTS = 3
+
+
+# --------------------------------------------------------------------------
+# Series construction
+# --------------------------------------------------------------------------
+def build_daily_series(
+    db: Session, product_id: int, as_of: date | None = None
+) -> pd.Series:
+    """Units sold per calendar day, zero-filled, indexed first-sale .. as_of."""
+    as_of = as_of or date.today()
+    rows = db.execute(
+        select(Sale.date, SaleItem.quantity)
+        .join(SaleItem, SaleItem.sale_id == Sale.id)
+        .where(SaleItem.product_id == product_id, Sale.date <= as_of)
+        .order_by(Sale.date)
+    ).all()
+
+    if not rows:
+        return pd.Series(dtype="float64", index=pd.DatetimeIndex([], name="date"))
+
+    frame = pd.DataFrame(rows, columns=["date", "quantity"])
+    frame["date"] = pd.to_datetime(frame["date"])
+    daily = frame.groupby("date", as_index=True)["quantity"].sum().astype("float64")
+
+    full_index = pd.date_range(daily.index.min(), pd.Timestamp(as_of), freq="D", name="date")
+    return daily.reindex(full_index, fill_value=0.0)
+
+
+def build_series_map(
+    db: Session, product_ids: list[int], as_of: date | None = None
+) -> dict[int, pd.Series]:
+    """All products' daily series in a single query (avoids N+1 on a full run)."""
+    as_of = as_of or date.today()
+    if not product_ids:
+        return {}
+
+    rows = db.execute(
+        select(SaleItem.product_id, Sale.date, SaleItem.quantity)
+        .join(Sale, Sale.id == SaleItem.sale_id)
+        .where(SaleItem.product_id.in_(product_ids), Sale.date <= as_of)
+    ).all()
+
+    out: dict[int, pd.Series] = {}
+    if not rows:
+        return {pid: pd.Series(dtype="float64") for pid in product_ids}
+
+    frame = pd.DataFrame(rows, columns=["product_id", "date", "quantity"])
+    frame["date"] = pd.to_datetime(frame["date"])
+    grouped = frame.groupby(["product_id", "date"], as_index=False)["quantity"].sum()
+
+    for pid in product_ids:
+        sub = grouped[grouped["product_id"] == pid]
+        if sub.empty:
+            out[pid] = pd.Series(dtype="float64")
+            continue
+        series = sub.set_index("date")["quantity"].astype("float64").sort_index()
+        full_index = pd.date_range(series.index.min(), pd.Timestamp(as_of), freq="D", name="date")
+        out[pid] = series.reindex(full_index, fill_value=0.0)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Metrics
+# --------------------------------------------------------------------------
+def mean_absolute_error(actual: np.ndarray, predicted: np.ndarray) -> float:
+    return float(np.mean(np.abs(actual - predicted)))
+
+
+def mean_absolute_percentage_error(actual: np.ndarray, predicted: np.ndarray) -> float | None:
+    """MAPE over days with meaningful sales only; None when not computable."""
+    mask = np.abs(actual) >= MAPE_MIN_ACTUAL
+    if int(mask.sum()) < MAPE_MIN_POINTS:
+        return None
+    pct = np.abs((actual[mask] - predicted[mask]) / actual[mask])
+    return float(np.mean(pct) * 100.0)
+
+
+# --------------------------------------------------------------------------
+# Candidate models
+# --------------------------------------------------------------------------
+@dataclass
+class ModelResult:
+    """One candidate's hold-out score and its refit forecast."""
+
+    name: str
+    mae: float
+    mape: float | None
+    params: dict = field(default_factory=dict)
+    # complexity is the tie-breaker: lower wins when MAE is effectively equal
+    complexity: int = 0
+    error: str | None = None
+
+
+class Candidate:
+    name = "base"
+    complexity = 0
+
+    def fit_predict(self, train: pd.Series, steps: int) -> np.ndarray:
+        raise NotImplementedError
+
+    def params(self) -> dict:
+        return {}
+
+
+class WeightedMovingAverage(Candidate):
+    """Flat forecast = linearly weighted average of the last ``window`` days."""
+
+    name = "weighted_moving_average"
+    complexity = 1
+
+    def __init__(self, window: int = 14):
+        self.window = window
+
+    def fit_predict(self, train: pd.Series, steps: int) -> np.ndarray:
+        window = min(self.window, len(train))
+        recent = train.to_numpy()[-window:]
+        weights = np.arange(1, window + 1, dtype="float64")  # newest day weighted most
+        value = float(np.sum(recent * weights) / np.sum(weights))
+        return np.full(steps, max(value, 0.0))
+
+    def params(self) -> dict:
+        return {"window": self.window, "weighting": "linear (newest = highest)"}
+
+
+class SimpleExpSmoothing(Candidate):
+    """statsmodels SES; alpha estimated by MLE. Flat forecast at the final level."""
+
+    name = "simple_exponential_smoothing"
+    complexity = 2
+
+    def __init__(self):
+        self._alpha: float | None = None
+
+    def fit_predict(self, train: pd.Series, steps: int) -> np.ndarray:
+        from statsmodels.tsa.holtwinters import SimpleExpSmoothing as SES
+
+        values = train.to_numpy(dtype="float64")
+        model = SES(values, initialization_method="estimated").fit(optimized=True)
+        self._alpha = float(model.params.get("smoothing_level", float("nan")))
+        forecast = np.asarray(model.forecast(steps), dtype="float64")
+        return np.clip(forecast, 0.0, None)
+
+    def params(self) -> dict:
+        return {"smoothing_level_alpha": None if self._alpha is None else round(self._alpha, 4)}
+
+
+LAGS = (1, 2, 3, 7, 14)
+ROLLING_WINDOWS = (7, 14, 28)
+
+
+def _feature_frame(series: pd.Series) -> pd.DataFrame:
+    """Lag + rolling + calendar features. Rolling windows are shifted by one day
+    so a row never sees its own target (no leakage)."""
+    df = pd.DataFrame({"y": series.astype("float64")})
+    df.index = pd.DatetimeIndex(series.index)
+
+    for lag in LAGS:
+        df[f"lag_{lag}"] = df["y"].shift(lag)
+    shifted = df["y"].shift(1)
+    for window in ROLLING_WINDOWS:
+        df[f"roll_mean_{window}"] = shifted.rolling(window, min_periods=1).mean()
+    df["roll_std_7"] = shifted.rolling(7, min_periods=2).std()
+
+    idx = df.index
+    df["dayofweek"] = idx.dayofweek
+    df["is_weekend"] = (idx.dayofweek >= 5).astype(int)
+    df["day"] = idx.day
+    # Kenyan dukas see a payday bump around month-end / month-start.
+    df["is_month_start"] = (idx.day <= 3).astype(int)
+    df["is_month_end"] = (idx.day >= 27).astype(int)
+    df["week_of_year"] = idx.isocalendar().week.to_numpy().astype(int)
+    df["trend"] = np.arange(len(df))
+    return df
+
+
+FEATURE_COLUMNS = (
+    [f"lag_{lag}" for lag in LAGS]
+    + [f"roll_mean_{w}" for w in ROLLING_WINDOWS]
+    + [
+        "roll_std_7",
+        "dayofweek",
+        "is_weekend",
+        "day",
+        "is_month_start",
+        "is_month_end",
+        "week_of_year",
+        "trend",
+    ]
+)
+
+
+class GradientBoosting(Candidate):
+    """HistGradientBoostingRegressor over lag/rolling/calendar features.
+
+    Multi-step forecasting is recursive: predict day t+1, append it to the
+    series, rebuild features, predict t+2, and so on.
+    """
+
+    name = "gradient_boosting"
+    complexity = 3
+
+    def __init__(self, max_iter: int = 200, learning_rate: float = 0.06, max_depth: int = 4):
+        self.max_iter = max_iter
+        self.learning_rate = learning_rate
+        self.max_depth = max_depth
+
+    def fit_predict(self, train: pd.Series, steps: int) -> np.ndarray:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+
+        frame = _feature_frame(train)
+        # Drop the warm-up rows where the longest lag is still undefined.
+        usable = frame.dropna(subset=[f"lag_{max(LAGS)}"])
+        if len(usable) < 10:
+            raise ValueError("not enough rows after feature warm-up")
+
+        model = HistGradientBoostingRegressor(
+            max_iter=self.max_iter,
+            learning_rate=self.learning_rate,
+            max_depth=self.max_depth,
+            min_samples_leaf=5,
+            l2_regularization=1.0,
+            random_state=42,  # reproducible: same data in, same forecast out
+        )
+        model.fit(usable[FEATURE_COLUMNS], usable["y"])
+
+        history = train.copy()
+        predictions: list[float] = []
+        for _ in range(steps):
+            next_day = history.index[-1] + pd.Timedelta(days=1)
+            extended = pd.concat(
+                [history, pd.Series([np.nan], index=pd.DatetimeIndex([next_day]))]
+            )
+            features = _feature_frame(extended).iloc[[-1]][FEATURE_COLUMNS]
+            value = float(model.predict(features)[0])
+            value = max(value, 0.0)
+            predictions.append(value)
+            history = pd.concat(
+                [history, pd.Series([value], index=pd.DatetimeIndex([next_day]))]
+            )
+        return np.asarray(predictions, dtype="float64")
+
+    def params(self) -> dict:
+        return {
+            "estimator": "HistGradientBoostingRegressor",
+            "max_iter": self.max_iter,
+            "learning_rate": self.learning_rate,
+            "max_depth": self.max_depth,
+            "min_samples_leaf": 5,
+            "l2_regularization": 1.0,
+            "random_state": 42,
+            "features": FEATURE_COLUMNS,
+            "multi_step_strategy": "recursive",
+        }
+
+
+def _build_candidates() -> list[Candidate]:
+    return [WeightedMovingAverage(window=14), SimpleExpSmoothing(), GradientBoosting()]
+
+
+# --------------------------------------------------------------------------
+# Sufficiency
+# --------------------------------------------------------------------------
+@dataclass
+class Sufficiency:
+    ok: bool
+    reason: str | None
+    observations: int
+    nonzero: int
+    span_days: int
+
+
+def assess_sufficiency(series: pd.Series) -> Sufficiency:
+    observations = int(len(series))
+    if observations == 0:
+        return Sufficiency(False, "No sales recorded yet for this product.", 0, 0, 0)
+
+    nonzero = int((series > 0).sum())
+    span_days = int((series.index.max() - series.index.min()).days) + 1
+
+    if nonzero < settings.min_nonzero_observations:
+        return Sufficiency(
+            False,
+            f"Only {nonzero} day(s) with a recorded sale; at least "
+            f"{settings.min_nonzero_observations} are needed before a forecast is trustworthy.",
+            observations,
+            nonzero,
+            span_days,
+        )
+    if span_days < settings.min_history_days:
+        return Sufficiency(
+            False,
+            f"Sales history spans only {span_days} day(s); at least "
+            f"{settings.min_history_days} are needed.",
+            observations,
+            nonzero,
+            span_days,
+        )
+    return Sufficiency(True, None, observations, nonzero, span_days)
+
+
+# --------------------------------------------------------------------------
+# The bake-off
+# --------------------------------------------------------------------------
+@dataclass
+class ForecastOutcome:
+    sufficient: bool
+    reason: str | None = None
+    predicted_quantity: float | None = None
+    daily_predictions: list[float] = field(default_factory=list)
+    model_used: str | None = None
+    model_params: dict = field(default_factory=dict)
+    mae: float | None = None
+    mape: float | None = None
+    candidate_scores: list[dict] = field(default_factory=list)
+    observations: int = 0
+    nonzero: int = 0
+    window_start: date | None = None
+    window_end: date | None = None
+    holdout_days: int = 0
+
+
+def forecast_series(series: pd.Series, horizon_days: int) -> ForecastOutcome:
+    """Run the full gate -> hold-out bake-off -> refit -> forecast pipeline."""
+    sufficiency = assess_sufficiency(series)
+    if not sufficiency.ok:
+        return ForecastOutcome(
+            sufficient=False,
+            reason=sufficiency.reason,
+            observations=sufficiency.observations,
+            nonzero=sufficiency.nonzero,
+            window_start=series.index.min().date() if len(series) else None,
+            window_end=series.index.max().date() if len(series) else None,
+        )
+
+    n = len(series)
+    # Hold out the configured window, but never more than 30% of history, and
+    # always leave at least 21 training days behind.
+    holdout = min(settings.holdout_days, max(1, int(n * 0.3)), max(1, n - 21))
+    train, test = series.iloc[:-holdout], series.iloc[-holdout:]
+    actual = test.to_numpy(dtype="float64")
+
+    scores: list[ModelResult] = []
+    for candidate in _build_candidates():
+        try:
+            predicted = candidate.fit_predict(train, len(test))
+            scores.append(
+                ModelResult(
+                    name=candidate.name,
+                    mae=mean_absolute_error(actual, predicted),
+                    mape=mean_absolute_percentage_error(actual, predicted),
+                    params=candidate.params(),
+                    complexity=candidate.complexity,
+                )
+            )
+        except Exception as exc:  # a candidate failing must not kill the run
+            scores.append(
+                ModelResult(
+                    name=candidate.name,
+                    mae=float("inf"),
+                    mape=None,
+                    complexity=candidate.complexity,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
+
+    usable = [s for s in scores if math.isfinite(s.mae)]
+    if not usable:
+        return ForecastOutcome(
+            sufficient=False,
+            reason="No forecasting model could be fitted to this sales pattern.",
+            observations=sufficiency.observations,
+            nonzero=sufficiency.nonzero,
+            candidate_scores=[_score_dict(s) for s in scores],
+            window_start=series.index.min().date(),
+            window_end=series.index.max().date(),
+        )
+
+    # Winner = lowest MAE; ties (within 1%) go to the simpler model.
+    best = min(usable, key=lambda s: (round(s.mae, 6), s.complexity))
+    tolerance = best.mae * 1.01 + 1e-9
+    best = min([s for s in usable if s.mae <= tolerance], key=lambda s: s.complexity)
+
+    # Refit the winner on the FULL history and forecast the horizon.
+    winner = next(c for c in _build_candidates() if c.name == best.name)
+    try:
+        daily = winner.fit_predict(series, horizon_days)
+        final_params = winner.params()
+    except Exception:
+        # Extremely unlikely (it fitted on the shorter train set), but degrade to
+        # the always-available baseline rather than failing the whole run.
+        fallback = WeightedMovingAverage(window=14)
+        daily = fallback.fit_predict(series, horizon_days)
+        best = ModelResult(
+            name=fallback.name, mae=best.mae, mape=best.mape, complexity=fallback.complexity
+        )
+        final_params = fallback.params()
+
+    return ForecastOutcome(
+        sufficient=True,
+        predicted_quantity=float(np.sum(daily)),
+        daily_predictions=[round(float(v), 3) for v in daily],
+        model_used=best.name,
+        model_params=final_params,
+        mae=round(best.mae, 4),
+        mape=None if best.mape is None else round(best.mape, 2),
+        candidate_scores=[_score_dict(s) for s in scores],
+        observations=sufficiency.observations,
+        nonzero=sufficiency.nonzero,
+        window_start=series.index.min().date(),
+        window_end=series.index.max().date(),
+        holdout_days=holdout,
+    )
+
+
+def _score_dict(score: ModelResult) -> dict:
+    return {
+        "model": score.name,
+        "mae": None if not math.isfinite(score.mae) else round(score.mae, 4),
+        "mape": score.mape if score.mape is None else round(score.mape, 2),
+        "error": score.error,
+    }
+
+
+# --------------------------------------------------------------------------
+# Persistence
+# --------------------------------------------------------------------------
+def generate_forecasts(
+    db: Session,
+    *,
+    horizon_days: int | None = None,
+    product_ids: list[int] | None = None,
+    as_of: date | None = None,
+) -> list[Forecast]:
+    """Forecast every active product (or the given subset) and persist the rows."""
+    horizon_days = horizon_days or settings.default_horizon_days
+    as_of = as_of or date.today()
+
+    stmt = select(Product).where(Product.is_active.is_(True))
+    if product_ids:
+        stmt = stmt.where(Product.id.in_(product_ids))
+    products = db.execute(stmt.order_by(Product.name)).scalars().all()
+    if not products:
+        return []
+
+    series_map = build_series_map(db, [p.id for p in products], as_of=as_of)
+
+    created: list[Forecast] = []
+    for product in products:
+        outcome = forecast_series(series_map.get(product.id, pd.Series(dtype="float64")), horizon_days)
+        forecast = Forecast(
+            product_id=product.id,
+            horizon_days=horizon_days,
+            bucket="daily",
+            data_sufficiency_flag=(
+                DataSufficiency.sufficient if outcome.sufficient else DataSufficiency.insufficient_data
+            ),
+            insufficiency_reason=outcome.reason,
+            predicted_quantity=(
+                None if outcome.predicted_quantity is None else round(outcome.predicted_quantity, 3)
+            ),
+            model_used=outcome.model_used,
+            model_params=json.dumps(
+                {
+                    **outcome.model_params,
+                    "holdout_days": outcome.holdout_days,
+                    "bucket": "daily",
+                    "as_of": as_of.isoformat(),
+                    "daily_predictions": outcome.daily_predictions,
+                }
+            )
+            if outcome.sufficient
+            else None,
+            error_metrics=json.dumps({"MAE": outcome.mae, "MAPE": outcome.mape})
+            if outcome.sufficient
+            else None,
+            mae=outcome.mae,
+            mape=outcome.mape,
+            data_window_start=outcome.window_start,
+            data_window_end=outcome.window_end,
+            observations_used=outcome.observations,
+            nonzero_observations=outcome.nonzero,
+            candidate_scores=json.dumps(outcome.candidate_scores) if outcome.candidate_scores else None,
+        )
+        db.add(forecast)
+        created.append(forecast)
+
+    db.flush()
+    return created
+
+
+def latest_forecasts(
+    db: Session, horizon_days: int | None = None, product_ids: list[int] | None = None
+) -> dict[int, Forecast]:
+    """Most recent forecast per product, optionally pinned to one horizon."""
+    stmt = select(Forecast).order_by(Forecast.generated_at.asc(), Forecast.id.asc())
+    if horizon_days is not None:
+        stmt = stmt.where(Forecast.horizon_days == horizon_days)
+    if product_ids:
+        stmt = stmt.where(Forecast.product_id.in_(product_ids))
+    out: dict[int, Forecast] = {}
+    for forecast in db.execute(stmt).scalars():
+        out[forecast.product_id] = forecast  # later (newer) rows win
+    return out
+
+
+def forecast_window(forecast: Forecast) -> tuple[date, date]:
+    """The calendar days a stored forecast actually covers (used by the accuracy report)."""
+    start = (forecast.data_window_end or forecast.generated_at.date()) + timedelta(days=1)
+    return start, start + timedelta(days=forecast.horizon_days - 1)
+
+
+===== backend\app\services\recommendation.py =====
+
+"""Stockout-risk detection and budget-aware purchase recommendation.
+
+--------------------------------------------------------------------------
+How a product's need is worked out (spec 4.7 / 4.8)
+--------------------------------------------------------------------------
+    daily_rate       = forecast_demand / horizon_days
+    lead_time_demand = daily_rate x reorder_lead_time_days      (0 if unknown)
+    safety_stock     = safety_margin_pct x (forecast_demand + lead_time_demand)
+    projected_need   = forecast_demand + lead_time_demand + safety_stock
+    shortage         = ceil(max(0, projected_need - current_stock))
+
+A product is **at risk** when ``shortage > 0`` - i.e. what we expect to sell
+over the horizon (plus the cover needed while a new delivery is on its way, plus
+the safety margin) exceeds what is on the shelf today.
+
+--------------------------------------------------------------------------
+Priority score (only matters when the budget cannot cover everything)
+--------------------------------------------------------------------------
+UPDATED: four normalised 0-1 factors, combined with explicit weights:
+
+    priority = 0.40 x stockout_risk
+             + 0.30 x normalised_forecast_demand
+             + 0.20 x normalised_expected_gross_profit
+             + 0.10 x normalised_affordability
+
+* ``stockout_risk``   = shortage / projected_need, used AS-IS (not min-max
+  re-scaled across the batch). This ratio already means something on its own
+  - "what fraction of what I need am I missing" - and min-maxing it across
+  whichever products happen to be in this run would distort that meaning
+  (e.g. if every candidate this run is badly short, min-max would flatten
+  that into "half urgent, half not", which is wrong).
+* ``forecast_demand`` = the product's forecast_demand for this run, min-max
+  normalised across all candidates. (Equivalent in ranking terms to
+  normalising daily_rate, since every candidate in a run shares the same
+  horizon_days - but this matches the spec's wording directly.)
+* ``expected_gross_profit`` = forecast_demand x (selling_price - unit_cost),
+  min-max normalised across all candidates.
+* ``affordability`` = 1 / (1 + required_cost), where required_cost is what
+  it would cost to fully cover this product's shortage. Min-max normalised
+  across all candidates, same as the other three factors.
+
+``cost_efficiency_score`` (margin per shilling spent) is still computed and
+stored on every recommendation, since other parts of the app may read it -
+it just no longer feeds priority_score directly.
+
+Weights are configurable via settings.weight_stockout_risk,
+settings.weight_forecast_demand, settings.weight_expected_gross_profit and
+settings.weight_affordability (env vars DUKASMART_WEIGHT_STOCKOUT_RISK,
+DUKASMART_WEIGHT_FORECAST_DEMAND, DUKASMART_WEIGHT_EXPECTED_GROSS_PROFIT,
+DUKASMART_WEIGHT_AFFORDABILITY), validated at import time in config.py to
+sum to 1.0. Every run stores the weights it used in weights_used, so an old
+recommendation stays explainable even after the weights change.
+
+--------------------------------------------------------------------------
+Budget allocation
+--------------------------------------------------------------------------
+If ``total_required_cost <= budget``: everyone gets their full required quantity.
+
+Otherwise: walk the list top-down by priority rank, giving each product as much
+as the remaining budget allows (a partial fill is better than nothing). If a
+product cannot be afforded at all we keep walking - a cheaper item further down
+may still fit. This is a greedy allocation, chosen because it is explainable to
+a shop owner; an optimal knapsack solve would buy marginally more units but
+could not be justified line-by-line.
+
+UNCHANGED by this update. The "total expected gross profit of the basket" is
+computed from what's actually allocated (gross_profit_per_unit x
+recommended_quantity for each line, summed), not from full forecast demand -
+so a partially-funded product only contributes its partial share.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from datetime import date, datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..config import settings
+from ..models import (
+    Budget,
+    DataSufficiency,
+    Forecast,
+    Product,
+    Recommendation,
+    RecommendationRun,
+    RecommendationStatus,
+    User,
+)
+from .forecasting import generate_forecasts, latest_forecasts
+from .inventory import BusinessRuleError, current_stock_map, latest_unit_costs
+
+
+# --------------------------------------------------------------------------
+# Risk assessment
+# --------------------------------------------------------------------------
+def _need_profile(
+    *,
+    forecast_demand: float,
+    horizon_days: int,
+    lead_time_days: int | None,
+    safety_margin_pct: float,
+    current_stock: int,
+) -> dict:
+    daily_rate = forecast_demand / horizon_days if horizon_days else 0.0
+    lead_time_demand = daily_rate * (lead_time_days or 0)
+    safety_stock = safety_margin_pct * (forecast_demand + lead_time_demand)
+    projected_need = forecast_demand + lead_time_demand + safety_stock
+    shortage = max(0.0, projected_need - current_stock)
+    return {
+        "daily_rate": daily_rate,
+        "lead_time_demand": lead_time_demand,
+        "safety_stock": safety_stock,
+        "projected_need": projected_need,
+        "shortage": int(math.ceil(shortage)),
+        "days_of_cover": (current_stock / daily_rate) if daily_rate > 0 else None,
+    }
+
+
+def assess_stock_risk(
+    db: Session,
+    *,
+    horizon_days: int,
+    safety_margin_pct: float | None = None,
+    product_ids: list[int] | None = None,
+) -> list[dict]:
+    """Per-product risk rows for the dashboard ("Products running low")."""
+    safety_margin_pct = (
+        settings.default_safety_margin_pct if safety_margin_pct is None else safety_margin_pct
+    )
+
+    stmt = select(Product).where(Product.is_active.is_(True))
+    if product_ids:
+        stmt = stmt.where(Product.id.in_(product_ids))
+    products = db.execute(stmt.order_by(Product.name)).scalars().all()
+    ids = [p.id for p in products]
+
+    stock = current_stock_map(db, ids)
+    forecasts = latest_forecasts(db, horizon_days=horizon_days, product_ids=ids)
+
+    rows: list[dict] = []
+    for product in products:
+        forecast = forecasts.get(product.id)
+        on_hand = stock.get(product.id, 0)
+
+        if forecast is None:
+            rows.append(
+                _risk_row(
+                    product,
+                    on_hand,
+                    horizon_days,
+                    status="Not forecast yet",
+                    reason="No forecast has been generated for this product yet. "
+                    "Run 'Update forecasts' to include it.",
+                )
+            )
+            continue
+
+        if forecast.data_sufficiency_flag != DataSufficiency.sufficient:
+            rows.append(
+                _risk_row(
+                    product,
+                    on_hand,
+                    horizon_days,
+                    status="Not enough sales history",
+                    reason=forecast.insufficiency_reason
+                    or "Not enough sales history to forecast this product yet.",
+                    forecast_id=forecast.id,
+                )
+            )
+            continue
+
+        profile = _need_profile(
+            forecast_demand=float(forecast.predicted_quantity or 0.0),
+            horizon_days=forecast.horizon_days,
+            lead_time_days=product.reorder_lead_time_days,
+            safety_margin_pct=safety_margin_pct,
+            current_stock=on_hand,
+        )
+        at_risk = profile["shortage"] > 0
+        cover = profile["days_of_cover"]
+
+        if at_risk:
+            status = "Running low"
+            reason = (
+                f"Expect to sell about {float(forecast.predicted_quantity or 0):.0f} in the next "
+                f"{horizon_days} days; only {on_hand} on the shelf. "
+                f"Short by about {profile['shortage']}."
+            )
+        else:
+            status = "Stock is fine"
+            cover_text = f"about {cover:.0f} days of cover" if cover is not None else "healthy cover"
+            reason = f"{on_hand} in stock covers the next {horizon_days} days ({cover_text})."
+
+        rows.append(
+            {
+                "product_id": product.id,
+                "name": product.name,
+                "sku": product.sku,
+                "current_stock": on_hand,
+                "horizon_days": horizon_days,
+                "forecast_demand": round(float(forecast.predicted_quantity or 0.0), 2),
+                "lead_time_demand": round(profile["lead_time_demand"], 2),
+                "safety_stock": round(profile["safety_stock"], 2),
+                "projected_need": round(profile["projected_need"], 2),
+                "estimated_shortage": profile["shortage"],
+                "at_risk": at_risk,
+                "days_of_cover": None if cover is None else round(cover, 1),
+                "status": status,
+                "reason": reason,
+                "forecast_id": forecast.id,
+                "model_used": forecast.model_used,
+            }
+        )
+
+    # Most urgent first.
+    rows.sort(key=lambda r: (not r["at_risk"], -(r["estimated_shortage"] or 0), r["name"]))
+    return rows
+
+
+def _risk_row(product, on_hand, horizon_days, *, status, reason, forecast_id=None) -> dict:
+    return {
+        "product_id": product.id,
+        "name": product.name,
+        "sku": product.sku,
+        "current_stock": on_hand,
+        "horizon_days": horizon_days,
+        "forecast_demand": None,
+        "lead_time_demand": 0.0,
+        "safety_stock": 0.0,
+        "projected_need": None,
+        "estimated_shortage": 0,
+        "at_risk": False,
+        "days_of_cover": None,
+        "status": status,
+        "reason": reason,
+        "forecast_id": forecast_id,
+        "model_used": None,
+    }
+
+
+# --------------------------------------------------------------------------
+# Normalisation helper
+# --------------------------------------------------------------------------
+def _normalise(values: list[float]) -> list[float]:
+    """Min-max scale to 0-1. All-equal inputs map to 1.0 (no product penalised)."""
+    if not values:
+        return []
+    low, high = min(values), max(values)
+    if high - low < 1e-12:
+        return [1.0 for _ in values]
+    return [(v - low) / (high - low) for v in values]
+
+
+# --------------------------------------------------------------------------
+# NEW: short, skimmable "what drove this ranking" label
+# --------------------------------------------------------------------------
+def _priority_label(
+    *,
+    risk: float,
+    demand: float,
+    profit: float,
+    affordability: float,
+    weight_stockout_risk: float,
+    weight_forecast_demand: float,
+    weight_expected_gross_profit: float,
+    weight_affordability: float,
+) -> str:
+    """One-line tag for a table column, e.g. 'High demand + high margin' or
+    'Urgent: stockout risk'. Distinct from `reason`, which stays a full
+    paragraph - this is meant to be skimmed at a glance.
+    """
+    if risk >= 0.8:
+        # A near-empty shelf dominates how this line should read, regardless
+        # of the other three factors' weighted contribution.
+        return "Urgent: stockout risk"
+
+    contributions = {
+        "stockout risk": weight_stockout_risk * risk,
+        "high demand": weight_forecast_demand * demand,
+        "high margin": weight_expected_gross_profit * profit,
+        "affordability": weight_affordability * affordability,
+    }
+    ranked = sorted(contributions.items(), key=lambda kv: kv[1], reverse=True)
+    top_name, top_value = ranked[0]
+    second_name, second_value = ranked[1]
+
+    if top_value <= 0:
+        return "Balanced priority"
+
+    if second_value > 0 and second_value >= top_value * 0.6:
+        # Two factors are close enough that both deserve credit.
+        return f"{top_name.capitalize()} + {second_name}"
+
+    return top_name.capitalize()
+
+
+# --------------------------------------------------------------------------
+# The recommendation run
+# --------------------------------------------------------------------------
+def generate_recommendation_run(
+    db: Session,
+    *,
+    user: User,
+    budget_id: int,
+    horizon_days: int,
+    safety_margin_pct: float,
+    refresh_forecasts: bool = True,
+    as_of: date | None = None,
+) -> RecommendationRun:
+    budget = db.get(Budget, budget_id)
+    if budget is None:
+        raise BusinessRuleError("That budget was not found. Create a budget first.")
+    if budget.amount_available <= 0:
+        raise BusinessRuleError("The budget must be more than zero.")
+
+    with db.begin_nested():
+        if refresh_forecasts:
+            generate_forecasts(db, horizon_days=horizon_days, as_of=as_of)
+
+        products = (
+            db.execute(select(Product).where(Product.is_active.is_(True)).order_by(Product.name))
+            .scalars()
+            .all()
+        )
+        ids = [p.id for p in products]
+        stock = current_stock_map(db, ids)
+        forecasts = latest_forecasts(db, horizon_days=horizon_days, product_ids=ids)
+        costs = latest_unit_costs(db, ids)
+
+        candidates: list[dict] = []
+        skipped_no_forecast = 0
+        skipped_no_cost = 0
+
+        for product in products:
+            forecast = forecasts.get(product.id)
+            if forecast is None or forecast.data_sufficiency_flag != DataSufficiency.sufficient:
+                skipped_no_forecast += 1
+                continue
+
+            on_hand = stock.get(product.id, 0)
+            demand = float(forecast.predicted_quantity or 0.0)
+            profile = _need_profile(
+                forecast_demand=demand,
+                horizon_days=forecast.horizon_days,
+                lead_time_days=product.reorder_lead_time_days,
+                safety_margin_pct=safety_margin_pct,
+                current_stock=on_hand,
+            )
+            if profile["shortage"] <= 0:
+                continue  # not at risk - nothing to buy
+
+            unit_cost = float(costs.get(product.id) or product.default_unit_cost or 0.0)
+            if unit_cost <= 0:
+                # We cannot budget for something with no known purchase cost.
+                skipped_no_cost += 1
+                continue
+
+            # --- NEW: profitability figures, computed once per candidate ---
+            gross_profit_per_unit = float(product.selling_price) - unit_cost
+            expected_gross_profit = demand * gross_profit_per_unit
+            # --- end new ---
+
+            candidates.append(
+                {
+                    "product": product,
+                    "forecast": forecast,
+                    "current_stock": on_hand,
+                    "forecast_demand": demand,
+                    "unit_cost": unit_cost,
+                    "gross_profit_per_unit": gross_profit_per_unit,
+                    "expected_gross_profit": expected_gross_profit,
+                    **profile,
+                }
+            )
+
+        # ---- scoring ---------------------------------------------------
+        if candidates:
+            velocities = [c["daily_rate"] for c in candidates]
+            margins = [
+                max(0.0, float(c["product"].selling_price) - c["unit_cost"]) / c["unit_cost"]
+                for c in candidates
+            ]
+            if max(margins) <= 0:
+                # No margin data worth using -> fall back to cheap-first.
+                margins = [1.0 / c["unit_cost"] for c in candidates]
+
+            velocity_scores = _normalise(velocities)
+            cost_scores = _normalise(margins)
+
+            # --- NEW: the four factors that actually feed priority_score now ---
+            demand_scores = _normalise([c["forecast_demand"] for c in candidates])
+            profit_scores = _normalise([c["expected_gross_profit"] for c in candidates])
+            required_costs = [c["shortage"] * c["unit_cost"] for c in candidates]
+            affordability_raw = [1.0 / (1.0 + rc) for rc in required_costs]
+            affordability_scores = _normalise(affordability_raw)
+            # --- end new ---
+
+            for c, vel, ce, dem, prof, afford in zip(
+                candidates,
+                velocity_scores,
+                cost_scores,
+                demand_scores,
+                profit_scores,
+                affordability_scores,
+                strict=True,
+            ):
+                risk = (
+                    min(1.0, c["shortage"] / c["projected_need"]) if c["projected_need"] > 0 else 0.0
+                )
+                c["stockout_risk_score"] = risk
+                c["demand_velocity_score"] = vel
+                # Still computed and stored for backward compatibility / other
+                # reports, but no longer part of priority_score below.
+                c["cost_efficiency_score"] = ce
+
+                # --- NEW: the updated 4-factor weighted priority score ---
+                c["priority_score"] = (
+                    settings.weight_stockout_risk * risk
+                    + settings.weight_forecast_demand * dem
+                    + settings.weight_expected_gross_profit * prof
+                    + settings.weight_affordability * afford
+                )
+                c["priority_label"] = _priority_label(
+                    risk=risk,
+                    demand=dem,
+                    profit=prof,
+                    affordability=afford,
+                    weight_stockout_risk=settings.weight_stockout_risk,
+                    weight_forecast_demand=settings.weight_forecast_demand,
+                    weight_expected_gross_profit=settings.weight_expected_gross_profit,
+                    weight_affordability=settings.weight_affordability,
+                )
+                # --- end new ---
+
+            # Highest priority first; cheaper line wins a tie so the budget stretches.
+            candidates.sort(
+                key=lambda c: (-c["priority_score"], c["shortage"] * c["unit_cost"], c["product"].name)
+            )
+
+        total_required = sum(c["shortage"] * c["unit_cost"] for c in candidates)
+        budget_amount = float(budget.amount_available)
+        constrained = total_required > budget_amount + 1e-9
+
+        run = RecommendationRun(
+            user_id=user.id,
+            budget_id=budget.id,
+            horizon_days=horizon_days,
+            safety_margin_pct=safety_margin_pct,
+            budget_amount=budget_amount,
+            total_required_cost=round(total_required, 2),
+            total_recommended_cost=0.0,
+            budget_constrained=constrained,
+            weights_used=json.dumps(
+                {
+                    "stockout_risk": settings.weight_stockout_risk,
+                    "forecast_demand": settings.weight_forecast_demand,
+                    "expected_gross_profit": settings.weight_expected_gross_profit,
+                    "affordability": settings.weight_affordability,
+                }
+            ),
+            products_considered=len(candidates),
+            products_skipped_no_forecast=skipped_no_forecast,
+            products_skipped_no_cost=skipped_no_cost,
+        )
+        db.add(run)
+        db.flush()
+
+        # ---- allocation -------------------------------------------------
+        remaining = budget_amount
+        total_allocated = 0.0
+
+        for rank, c in enumerate(candidates, start=1):
+            required_qty = int(c["shortage"])
+            unit_cost = c["unit_cost"]
+            required_cost = required_qty * unit_cost
+
+            if not constrained:
+                allocated_qty = required_qty
+            else:
+                affordable = int(math.floor((remaining + 1e-9) / unit_cost))
+                allocated_qty = max(0, min(required_qty, affordable))
+
+            allocated_cost = round(allocated_qty * unit_cost, 2)
+            remaining -= allocated_cost
+            total_allocated += allocated_cost
+
+            db.add(
+                Recommendation(
+                    run_id=run.id,
+                    product_id=c["product"].id,
+                    forecast_id=c["forecast"].id,
+                    current_stock=c["current_stock"],
+                    forecast_demand=round(c["forecast_demand"], 3),
+                    safety_stock=round(c["safety_stock"], 3),
+                    lead_time_demand=round(c["lead_time_demand"], 3),
+                    estimated_shortage=required_qty,
+                    unit_cost=round(unit_cost, 2),
+                    required_quantity=required_qty,
+                    required_cost=round(required_cost, 2),
+                    recommended_quantity=allocated_qty,
+                    recommended_cost=allocated_cost,
+                    stockout_risk_score=round(c["stockout_risk_score"], 4),
+                    demand_velocity_score=round(c["demand_velocity_score"], 4),
+                    cost_efficiency_score=round(c["cost_efficiency_score"], 4),
+                    priority_score=round(c["priority_score"], 4),
+                    priority_rank=rank,
+                    reason=_explain(c, required_qty, allocated_qty, rank, constrained),
+                    # --- NEW: profitability-aware columns ---
+                    gross_profit_per_unit=round(c["gross_profit_per_unit"], 2),
+                    expected_gross_profit=round(c["expected_gross_profit"], 2),
+                    priority_reason=c["priority_label"],
+                    # --- end new ---
+                    status=RecommendationStatus.proposed,
+                )
+            )
+
+        run.total_recommended_cost = round(total_allocated, 2)
+        # NOTE: total_expected_gross_profit is intentionally NOT set here as a
+        # Python attribute. An earlier draft did that, but it only survives
+        # for a run fetched in the same request/session it was generated in -
+        # any later fetch (list_runs, latest_run, get_run in planning.py)
+        # would silently see 0 instead of the real total. Since
+        # gross_profit_per_unit and recommended_quantity are both persisted
+        # columns on every Recommendation row, the router derives this total
+        # from the database instead (see _run_out in routers/planning.py),
+        # which works correctly for every run, old or new.
+        db.flush()
+
+    return run
+
+
+def _explain(c: dict, required_qty: int, allocated_qty: int, rank: int, constrained: bool) -> str:
+    """Plain-language 'why this line' text shown next to every recommendation.
+
+    Unchanged by the profitability update - this stays the detailed
+    paragraph it always was. The new short priority label lives in
+    `priority_reason` instead (see `_priority_label` above), so nothing here
+    needed to change.
+    """
+    product = c["product"]
+    horizon = c["forecast"].horizon_days
+    parts = [
+        f"You have {c['current_stock']} {product.name} left.",
+        f"Sales are running at about {c['daily_rate']:.1f} a day, so you should sell roughly "
+        f"{c['forecast_demand']:.0f} over the next {horizon} days.",
+    ]
+    if c["lead_time_demand"] > 0:
+        parts.append(
+            f"Allowing {product.reorder_lead_time_days} day(s) for delivery adds about "
+            f"{c['lead_time_demand']:.0f} more."
+        )
+    parts.append(
+        f"With a safety cushion of {c['safety_stock']:.0f}, you are short about {required_qty}."
+    )
+    if allocated_qty == 0:
+        parts.append("There is no budget left for this one after the higher-priority items.")
+    elif allocated_qty < required_qty:
+        parts.append(
+            f"Budget only stretches to {allocated_qty} of the {required_qty} needed "
+            f"(priority #{rank})."
+        )
+    elif constrained:
+        parts.append(f"Fully covered as priority #{rank}.")
+    else:
+        parts.append("The budget covers everything needed.")
+    return " ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Operator decisions
+# --------------------------------------------------------------------------
+def apply_decision(
+    db: Session, *, recommendation_id: int, status: RecommendationStatus, quantity: int | None
+) -> Recommendation:
+    rec = db.get(Recommendation, recommendation_id)
+    if rec is None:
+        raise BusinessRuleError("That recommendation line was not found.")
+
+    if status == RecommendationStatus.modified:
+        if quantity is None:
+            raise BusinessRuleError("Enter the quantity you want to buy.")
+        if quantity < 0:
+            raise BusinessRuleError("Quantity cannot be negative.")
+        rec.operator_quantity = int(quantity)
+    elif status == RecommendationStatus.accepted:
+        rec.operator_quantity = rec.recommended_quantity
+    elif status == RecommendationStatus.rejected:
+        rec.operator_quantity = 0
+
+    rec.status = status
+    rec.decided_at = datetime.now(timezone.utc)
+    db.flush()
+    return rec
+
+
+===== backend\app\services\inventory.py =====
+
+"""Stock derivation and the atomic stock-changing operations.
+
+The golden rule of this module: **stock is never stored, only derived.**
+``current_stock(product)`` is ``SUM(inventory_movements.change_qty)``. Each
+movement also records ``resulting_stock`` as a point-in-time snapshot so the
+audit trail reads naturally, but that column is a convenience, never the truth.
+
+Every public function that changes stock does so inside a single database
+transaction: either the Sale + SaleItems + InventoryMovements all land, or none
+of them do.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from ..models import (
+    InventoryMovement,
+    MovementSource,
+    Product,
+    Purchase,
+    PurchaseItem,
+    Sale,
+    SaleItem,
+    User,
+)
+
+
+class BusinessRuleError(Exception):
+    """Raised for input that is well-formed but not allowed by the business rules.
+
+    Routers translate this into an HTTP 400 with the message shown to the user,
+    so messages must be written in plain language.
+    """
+
+
+# --------------------------------------------------------------------------
+# Derivation
+# --------------------------------------------------------------------------
+def current_stock(db: Session, product_id: int) -> int:
+    total = db.execute(
+        select(func.coalesce(func.sum(InventoryMovement.change_qty), 0)).where(
+            InventoryMovement.product_id == product_id
+        )
+    ).scalar_one()
+    return int(total or 0)
+
+
+def current_stock_map(db: Session, product_ids: list[int] | None = None) -> dict[int, int]:
+    """Stock for many products in one query (avoids N+1 on list screens)."""
+    stmt = select(
+        InventoryMovement.product_id,
+        func.coalesce(func.sum(InventoryMovement.change_qty), 0),
+    ).group_by(InventoryMovement.product_id)
+    if product_ids is not None:
+        if not product_ids:
+            return {}
+        stmt = stmt.where(InventoryMovement.product_id.in_(product_ids))
+    rows = db.execute(stmt).all()
+    result = {int(pid): int(qty or 0) for pid, qty in rows}
+    if product_ids is not None:
+        for pid in product_ids:
+            result.setdefault(pid, 0)
+    return result
+
+
+def _record_movement(
+    db: Session,
+    *,
+    product_id: int,
+    change_qty: int,
+    source_type: MovementSource,
+    source_id: int | None,
+    running_stock: int,
+    note: str | None = None,
+) -> InventoryMovement:
+    """Append one movement. ``running_stock`` is the stock *after* this change."""
+    movement = InventoryMovement(
+        product_id=product_id,
+        change_qty=change_qty,
+        source_type=source_type,
+        source_id=source_id,
+        resulting_stock=running_stock,
+        note=note,
+    )
+    db.add(movement)
+    return movement
+
+
+def _load_products(db: Session, product_ids: list[int]) -> dict[int, Product]:
+    products = db.execute(select(Product).where(Product.id.in_(product_ids))).scalars().all()
+    found = {p.id: p for p in products}
+    missing = [pid for pid in product_ids if pid not in found]
+    if missing:
+        raise BusinessRuleError(
+            f"Product(s) not found: {', '.join(str(m) for m in missing)}. "
+            "Refresh the product list and try again."
+        )
+    return found
+
+
+# --------------------------------------------------------------------------
+# Opening stock (product creation)
+# --------------------------------------------------------------------------
+def set_opening_stock(db: Session, product: Product, quantity: int, note: str = "Opening stock") -> None:
+    """Seed a brand-new product's shelf count as an adjustment movement.
+
+    Kept as a movement so stock stays fully derivable (spec 4.5:
+    opening_stock + purchases - sales).
+    """
+    if quantity <= 0:
+        return
+    _record_movement(
+        db,
+        product_id=product.id,
+        change_qty=quantity,
+        source_type=MovementSource.adjustment,
+        source_id=None,
+        running_stock=quantity,
+        note=note,
+    )
+
+
+# --------------------------------------------------------------------------
+# Sales
+# --------------------------------------------------------------------------
+def record_sale(
+    db: Session,
+    *,
+    user: User,
+    sale_date: date,
+    items: list[dict],
+    note: str | None = None,
+    allow_negative_stock: bool = False,
+) -> Sale:
+    """Record a sale: Sale + SaleItems + InventoryMovements, all or nothing.
+
+    ``items`` entries: ``{"product_id": int, "quantity": int, "unit_price_at_sale": float|None}``
+    """
+    if not items:
+        raise BusinessRuleError("A sale needs at least one product.")
+
+    product_ids = [int(i["product_id"]) for i in items]
+    products = _load_products(db, product_ids)
+    stock = current_stock_map(db, product_ids)
+
+    # Validate everything *before* writing anything, so a rejected line never
+    # leaves a half-written sale behind.
+    for item in items:
+        qty = int(item["quantity"])
+        if qty <= 0:
+            raise BusinessRuleError(
+                f"Quantity for {products[item['product_id']].name} must be more than zero."
+            )
+        price = item.get("unit_price_at_sale")
+        if price is not None and float(price) < 0:
+            raise BusinessRuleError(
+                f"Price for {products[item['product_id']].name} cannot be negative."
+            )
+        if not allow_negative_stock:
+            available = stock.get(int(item["product_id"]), 0)
+            if qty > available:
+                product = products[int(item["product_id"])]
+                raise BusinessRuleError(
+                    f"Not enough {product.name} in stock: you have {available} but tried to "
+                    f"sell {qty}. Record the delivery first, or correct the count."
+                )
+
+    # `db.begin_nested()` gives us a SAVEPOINT that rolls back cleanly on error
+    # even when the caller already opened a transaction (e.g. the seed script).
+    with db.begin_nested():
+        sale = Sale(user_id=user.id, date=sale_date, total_amount=0.0, note=note)
+        db.add(sale)
+        db.flush()  # assign sale.id
+
+        total = 0.0
+        for item in items:
+            pid = int(item["product_id"])
+            qty = int(item["quantity"])
+            product = products[pid]
+            unit_price = item.get("unit_price_at_sale")
+            unit_price = float(product.selling_price) if unit_price is None else float(unit_price)
+
+            db.add(
+                SaleItem(
+                    sale_id=sale.id,
+                    product_id=pid,
+                    quantity=qty,
+                    unit_price_at_sale=unit_price,
+                )
+            )
+            total += unit_price * qty
+
+            stock[pid] = stock.get(pid, 0) - qty
+            _record_movement(
+                db,
+                product_id=pid,
+                change_qty=-qty,
+                source_type=MovementSource.sale,
+                source_id=sale.id,
+                running_stock=stock[pid],
+            )
+
+        sale.total_amount = round(total, 2)
+        db.flush()
+
+    return sale
+
+
+# --------------------------------------------------------------------------
+# Purchases
+# --------------------------------------------------------------------------
+def record_purchase(
+    db: Session,
+    *,
+    user: User,
+    supplier_id: int,
+    date_received: date,
+    items: list[dict],
+    note: str | None = None,
+) -> Purchase:
+    """Record stock received: Purchase + PurchaseItems + InventoryMovements, atomically."""
+    if not items:
+        raise BusinessRuleError("A delivery needs at least one product.")
+
+    product_ids = [int(i["product_id"]) for i in items]
+    products = _load_products(db, product_ids)
+    stock = current_stock_map(db, product_ids)
+
+    for item in items:
+        if int(item["quantity_received"]) <= 0:
+            raise BusinessRuleError(
+                f"Quantity for {products[int(item['product_id'])].name} must be more than zero."
+            )
+        if float(item["unit_cost"]) < 0:
+            raise BusinessRuleError(
+                f"Cost for {products[int(item['product_id'])].name} cannot be negative."
+            )
+
+    with db.begin_nested():
+        purchase = Purchase(
+            user_id=user.id,
+            supplier_id=supplier_id,
+            date_received=date_received,
+            total_cost=0.0,
+            note=note,
+        )
+        db.add(purchase)
+        db.flush()
+
+        total = 0.0
+        for item in items:
+            pid = int(item["product_id"])
+            qty = int(item["quantity_received"])
+            unit_cost = float(item["unit_cost"])
+
+            db.add(
+                PurchaseItem(
+                    purchase_id=purchase.id,
+                    product_id=pid,
+                    quantity_received=qty,
+                    unit_cost=unit_cost,
+                )
+            )
+            total += unit_cost * qty
+
+            stock[pid] = stock.get(pid, 0) + qty
+            _record_movement(
+                db,
+                product_id=pid,
+                change_qty=qty,
+                source_type=MovementSource.purchase,
+                source_id=purchase.id,
+                running_stock=stock[pid],
+            )
+
+            # Link the product to this supplier if it is a new pairing, so the
+            # "who do I buy this from" answer stays current.
+            product = products[pid]
+            if supplier_id not in {s.id for s in product.suppliers}:
+                from ..models import Supplier
+
+                supplier = db.get(Supplier, supplier_id)
+                if supplier is not None:
+                    product.suppliers.append(supplier)
+            if product.preferred_supplier_id is None:
+                product.preferred_supplier_id = supplier_id
+
+        purchase.total_cost = round(total, 2)
+        db.flush()
+
+    return purchase
+
+
+# --------------------------------------------------------------------------
+# Manual adjustments (stock-take corrections, breakages, expiry)
+# --------------------------------------------------------------------------
+def record_adjustment(
+    db: Session, *, product_id: int, change_qty: int, note: str, allow_negative_stock: bool = False
+) -> InventoryMovement:
+    if change_qty == 0:
+        raise BusinessRuleError("Adjustment cannot be zero.")
+    product = db.get(Product, product_id)
+    if product is None:
+        raise BusinessRuleError("Product not found.")
+
+    available = current_stock(db, product_id)
+    new_stock = available + change_qty
+    if new_stock < 0 and not allow_negative_stock:
+        raise BusinessRuleError(
+            f"That would take {product.name} below zero (you have {available}). "
+            "Check the number and try again."
+        )
+
+    with db.begin_nested():
+        movement = _record_movement(
+            db,
+            product_id=product_id,
+            change_qty=change_qty,
+            source_type=MovementSource.adjustment,
+            source_id=None,
+            running_stock=new_stock,
+            note=note,
+        )
+        db.flush()
+    return movement
+
+
+# --------------------------------------------------------------------------
+# Costing helper shared by the recommendation engine
+# --------------------------------------------------------------------------
+def latest_unit_costs(db: Session, product_ids: list[int] | None = None) -> dict[int, float]:
+    """Most recent actual purchase cost per product.
+
+    Assumption (documented in the README): the best estimate of what restocking
+    will cost is what the shop last actually paid. Products never purchased fall
+    back to ``Product.default_unit_cost`` — handled by the caller.
+    """
+    if product_ids is not None and not product_ids:
+        return {}
+
+    # Rank purchase items by (date_received, purchase id) and keep the newest.
+    stmt = (
+        select(PurchaseItem.product_id, PurchaseItem.unit_cost)
+        .join(Purchase, Purchase.id == PurchaseItem.purchase_id)
+        .order_by(PurchaseItem.product_id, Purchase.date_received.asc(), Purchase.id.asc())
+    )
+    if product_ids is not None:
+        stmt = stmt.where(PurchaseItem.product_id.in_(product_ids))
+
+    latest: dict[int, float] = {}
+    for pid, cost in db.execute(stmt).all():
+        latest[int(pid)] = float(cost)  # later rows overwrite earlier ones
+    return latest
+
+
+===== backend\requirements.txt =====
+
+fastapi>=0.115
+uvicorn>=0.34
+SQLAlchemy>=2.0
+pydantic>=2.9
+pydantic-settings>=2.6
+email-validator>=2.2
+python-multipart>=0.0.12
+bcrypt>=4.2
+PyJWT>=2.9
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+statsmodels>=0.14
+pytest>=8.3
+httpx>=0.27
+
+
+===== frontend\package.json =====
+
+{
+  "name": "dukasmart-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.62.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "recharts": "^2.15.0",
+    "sonner": "^1.7.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.0.0",
+    "vite": "^6.0.0"
+  }
+}
+

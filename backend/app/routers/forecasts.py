@@ -34,10 +34,16 @@ def forecast_config(_: CurrentUser) -> dict:
         "min_history_days": settings.min_history_days,
         "holdout_days": settings.holdout_days,
         "default_safety_margin_pct": settings.default_safety_margin_pct,
+        # NOTE: field names updated to match the profitability-aware weights
+        # in config.py. The old names (demand_velocity, cost_efficiency) were
+        # renamed/replaced when priority_score picked up expected_gross_profit
+        # and affordability as separate factors - this dict just needed to
+        # catch up to that.
         "priority_weights": {
             "stockout_risk": settings.weight_stockout_risk,
-            "demand_velocity": settings.weight_demand_velocity,
-            "cost_efficiency": settings.weight_cost_efficiency,
+            "forecast_demand": settings.weight_forecast_demand,
+            "expected_gross_profit": settings.weight_expected_gross_profit,
+            "affordability": settings.weight_affordability,
         },
     }
 

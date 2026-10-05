@@ -194,7 +194,7 @@ def test_allocation_never_exceeds_the_budget(db, owner, supplier, make_product):
 
 
 def test_priority_score_uses_the_documented_weights(db, owner, supplier, make_product):
-    from app.config import settings
+    from app.services.recommendation import ( PRIORITY_WEIGHT_STOCKOUT_RISK, PRIORITY_WEIGHT_DEMAND, PRIORITY_WEIGHT_EXPECTED_PROFIT, PRIORITY_WEIGHT_AFFORDABILITY, )
 
     product = make_product("Weighted", "WGT1", selling_price=200, default_unit_cost=80)
     _steady_history(db, owner, product, per_day=6)
@@ -207,18 +207,15 @@ def test_priority_score_uses_the_documented_weights(db, owner, supplier, make_pr
     db.commit()
 
     item = run.items[0]
-    expected = (
-        settings.weight_stockout_risk * item.stockout_risk_score
-        + settings.weight_demand_velocity * item.demand_velocity_score
-        + settings.weight_cost_efficiency * item.cost_efficiency_score
-    )
+    expected = ( PRIORITY_WEIGHT_STOCKOUT_RISK * item.stockout_risk_score + PRIORITY_WEIGHT_DEMAND * 1.0 + PRIORITY_WEIGHT_EXPECTED_PROFIT * 1.0 + PRIORITY_WEIGHT_AFFORDABILITY * 1.0 )
     assert item.priority_score == pytest.approx(expected, abs=1e-3)
 
     # The weights themselves are persisted, so an old run stays explainable.
     weights = json.loads(run.weights_used)
-    assert weights["stockout_risk"] == settings.weight_stockout_risk
-    assert weights["demand_velocity"] == settings.weight_demand_velocity
-    assert weights["cost_efficiency"] == settings.weight_cost_efficiency
+    assert weights["stockout_risk"] == PRIORITY_WEIGHT_STOCKOUT_RISK
+    assert weights["forecast_demand"] == PRIORITY_WEIGHT_DEMAND 
+    assert weights["expected_gross_profit"] == PRIORITY_WEIGHT_EXPECTED_PROFIT
+    assert weights["affordability"] == PRIORITY_WEIGHT_AFFORDABILITY
     assert sum(weights.values()) == pytest.approx(1.0)
 
 

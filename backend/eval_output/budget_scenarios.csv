@@ -1,0 +1,7 @@
+scenario,budget,constrained,products_considered,total_required_cost,total_recommended_cost,items_fully_funded,items_partially_funded,items_unfunded,runtime_seconds
+S1,500.0,True,5,2256.57,497.4,0,1,4,0.0596
+S2,1000.0,True,5,2256.57,972.42,1,2,2,0.027
+S3,2000.0,True,5,2256.57,1998.75,3,1,1,0.0252
+S4,5000.0,False,5,2256.57,2256.57,5,0,0,0.0303
+S5,10000.0,False,5,2256.57,2256.57,5,0,0,0.0219
+S6,20000.0,False,5,2256.57,2256.57,5,0,0,0.0194

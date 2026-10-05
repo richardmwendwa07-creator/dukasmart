@@ -1,0 +1,25 @@
+{
+  "environment": {
+    "python": "3.14.4",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "fastapi": "0.141.1",
+    "sqlalchemy": "2.0.52",
+    "scikit_learn": "1.9.0",
+    "pandas": "3.0.5",
+    "numpy": "2.5.2",
+    "generated_at": "2026-10-02"
+  },
+  "data_summary": {
+    "users": 2,
+    "products": 16,
+    "active_products": 16,
+    "sales": 351,
+    "sale_items": 1214,
+    "forecasts": 0,
+    "recommendation_runs": 0
+  },
+  "forecast_products": 16,
+  "forecast_with_metrics": 14,
+  "at_risk_products": 5,
+  "budget_scenarios": 6
+}

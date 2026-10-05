@@ -1,0 +1,17 @@
+product_id,name,sku,current_stock,forecast_demand,estimated_shortage,at_risk,status,model_used
+11,Laundry Soap Bar,SOAPBR,0,10.0,14,True,Running low,weighted_moving_average
+3,Sugar 1kg,SUG1KG,0,6.0,8,True,Running low,weighted_moving_average
+5,Bread 400g,BRD400,0,3.14,4,True,Running low,weighted_moving_average
+6,Fresh Milk 500ml,MLK500,0,2.84,4,True,Running low,gradient_boosting
+10,Bottled Water 1L,WTR1L,0,1.71,3,True,Running low,weighted_moving_average
+15,Cocoa Drink 400g,COC400,3,,0,False,Not enough sales history,
+2,Cooking Oil 1L,OIL1L,24,0.0,0,False,Stock is fine,weighted_moving_average
+7,Eggs (tray of 30),EGG30,2,0.0,0,False,Stock is fine,weighted_moving_average
+1,Maize Flour 2kg,MF2KG,79,0.0,0,False,Stock is fine,weighted_moving_average
+14,Matches (pack of 10),MTCH10,41,0.0,0,False,Stock is fine,weighted_moving_average
+4,Rice 1kg,RIC1KG,16,0.0,0,False,Stock is fine,weighted_moving_average
+13,Salt 1kg,SLT1KG,12,0.0,0,False,Stock is fine,weighted_moving_average
+16,Shoe Polish 50ml,SHP50,9,,0,False,Not enough sales history,
+9,Soda 500ml,SOD500,12,0.0,0,False,Stock is fine,weighted_moving_average
+8,Tea Leaves 250g,TEA250,9,0.0,0,False,Stock is fine,weighted_moving_average
+12,Washing Powder 500g,WSH500,28,0.0,0,False,Stock is fine,weighted_moving_average

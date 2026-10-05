@@ -361,9 +361,10 @@ All settings live in `backend/app/config.py`, overridable by environment variabl
 | `DUKASMART_DEFAULT_HORIZON_DAYS` | `14` | Default look-ahead |
 | `DUKASMART_ALLOWED_HORIZONS` | `7,14,30` | Horizons offered in the UI |
 | `DUKASMART_DEFAULT_SAFETY_MARGIN_PCT` | `0.20` | Default safety cushion |
-| `DUKASMART_WEIGHT_STOCKOUT_RISK` | `0.50` | Priority weight |
-| `DUKASMART_WEIGHT_DEMAND_VELOCITY` | `0.30` | Priority weight |
-| `DUKASMART_WEIGHT_COST_EFFICIENCY` | `0.20` | Priority weight |
+| `DUKASMART_WEIGHT_STOCKOUT_RISK` | `0.40` | Priority weight |
+| `DUKASMART_WEIGHT_FORECAST_DEMAND` | `0.30` | Priority weight |
+| `DUKASMART_WEIGHT_EXPECTED_GROSS_PROFIT` | `0.20` | Priority weight |
+| `DUKASMART_WEIGHT_AFFORDABILITY` | `0.10` | Priority weight |
 
 ---
 

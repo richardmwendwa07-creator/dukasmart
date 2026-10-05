@@ -364,6 +364,20 @@ class RecommendationOut(ORMModel):
     unfunded_quantity: int = 0
     unfunded_cost: float = 0
 
+    # --- NEW: profitability-aware fields ---
+    # gross_profit_per_unit = product.selling_price - unit_cost
+    # expected_gross_profit = forecast_demand x gross_profit_per_unit
+    # Nullable because older recommendation rows created before this
+    # feature was added won't have these values populated.
+    gross_profit_per_unit: float | None = None
+    expected_gross_profit: float | None = None
+    # Short, skimmable label naming what drove this product's rank, e.g.
+    # "High demand + high margin", "Urgent: stockout risk". Separate from
+    # `reason` above (the existing full-paragraph explanation) - meant for
+    # a table column rather than a sentence.
+    priority_reason: str | None = None
+    # --- end new fields ---
+
 
 class RecommendationRunOut(ORMModel):
     id: int
@@ -383,6 +397,14 @@ class RecommendationRunOut(ORMModel):
     products_skipped_no_cost: int = 0
     weights_used: dict | None = None
     items: list[RecommendationOut] = Field(default_factory=list)
+
+    # --- NEW: sum of expected_gross_profit across every item in `items`.
+    # Computed in the service layer (not stored on RecommendationRun in the
+    # database - see the note in models.py) and attached to the response
+    # object before it's returned, so the frontend can show one basket-level
+    # total without having to sum client-side.
+    total_expected_gross_profit: float = 0
+    # --- end new field ---
 
     @field_validator("weights_used", mode="before")
     @classmethod

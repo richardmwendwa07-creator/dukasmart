@@ -80,6 +80,20 @@ def _run_out(db, run: RecommendationRun) -> RecommendationRunOut:
         line.unfunded_cost = round(line.unfunded_quantity * float(rec.unit_cost), 2)
         items.append(line)
     out.items = items
+
+    # --- NEW: total expected gross profit of the recommended basket.
+    # Derived from persisted columns (gross_profit_per_unit x
+    # recommended_quantity, summed across every line) rather than trusting
+    # any value already on `run` - this way it's correct whether `run` was
+    # just generated or is being re-fetched later (list_runs, latest_run,
+    # get_run all go through this same function). `gross_profit_per_unit`
+    # is nullable (recommendations created before this feature existed won't
+    # have it), so those lines simply contribute 0 rather than erroring.
+    out.total_expected_gross_profit = round(
+        sum((rec.gross_profit_per_unit or 0) * rec.recommended_quantity for rec in run.items), 2
+    )
+    # --- end new ---
+
     return out
 
 

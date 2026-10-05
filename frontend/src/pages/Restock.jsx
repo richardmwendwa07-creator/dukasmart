@@ -36,8 +36,47 @@ const STATUS_LABEL = {
   rejected: 'Skipping',
 }
 
+// Mirrors PRIORITY_WEIGHT_* in services/recommendation.py — used only as a
+// fallback for older runs whose `weights_used` was persisted before the
+// profitability update (or is missing for any other reason). Whenever
+// run.weights_used is present, that's what's actually shown: this object
+// never overrides real data, it just fills the gap when there is none.
+const DEFAULT_WEIGHTS = {
+  stockout_risk: 0.4,
+  forecast_demand: 0.3,
+  expected_gross_profit: 0.2,
+  affordability: 0.1,
+}
+
+// Human-readable label + one-line description for each weight key the
+// backend sends in `weights_used`. Keyed the same as PRIORITY_WEIGHT_* /
+// the dict built in generate_recommendation_run().
+const FACTOR_INFO = {
+  stockout_risk: {
+    title: 'How empty the shelf is',
+    description: 'How much of what you need is missing right now.',
+  },
+  forecast_demand: {
+    title: 'How fast it sells',
+    description: 'Fast movers earn the money back soonest.',
+  },
+  expected_gross_profit: {
+    title: 'Profit it stands to earn',
+    description: 'Products expected to bring in the most profit rank higher.',
+  },
+  affordability: {
+    title: 'How well it fits the budget',
+    description: 'Cheaper lines are easier to fund fully alongside everything else.',
+  },
+}
+
+function factorPct(weights, key) {
+  const source = weights && typeof weights[key] === 'number' ? weights : DEFAULT_WEIGHTS
+  return Math.round((source[key] ?? 0) * 100)
+}
+
 /** One recommendation line: the numbers, the reasoning, and the decision buttons. */
-function RecommendationCard({ item, rank }) {
+function RecommendationCard({ item, rank, weights }) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -61,6 +100,13 @@ function RecommendationCard({ item, rank }) {
   const needed = item.required_quantity
   const partial = funded > 0 && funded < needed
   const unfunded = funded === 0
+  const hasProfitData = item.gross_profit_per_unit != null && item.expected_gross_profit != null
+  // Profit tied to what's actually being bought right now — matches how the
+  // top-of-page "Expected profit" total is built (gross_profit_per_unit x
+  // recommended_quantity, summed across the run). Different from
+  // item.expected_gross_profit below, which is the product's full 30-day
+  // forecast demand x margin, regardless of how much is being topped up today.
+  const orderProfit = hasProfitData ? item.gross_profit_per_unit * item.recommended_quantity : null
 
   return (
     <div
@@ -86,6 +132,11 @@ function RecommendationCard({ item, rank }) {
           <div className="flex flex-wrap items-center gap-2">
             <p className="font-semibold text-slate-900">{item.product_name}</p>
             <span className={STATUS_BADGE[item.status]}>{STATUS_LABEL[item.status]}</span>
+            {item.priority_reason && (
+              <span className="badge-info" title="What drove this product's ranking">
+                {item.priority_reason}
+              </span>
+            )}
             {unfunded && item.status === 'proposed' && (
               <span className="badge-warn">No budget left</span>
             )}
@@ -155,6 +206,11 @@ function RecommendationCard({ item, rank }) {
                   {units(needed - funded)} more needed ({money(item.unfunded_cost)})
                 </p>
               )}
+              {hasProfitData && orderProfit > 0 && (
+                <p className="text-xs text-emerald-700">
+                  ~{money(orderProfit)} profit from this order
+                </p>
+              )}
             </>
           )}
         </div>
@@ -217,6 +273,11 @@ function RecommendationCard({ item, rank }) {
       {open && (
         <div className="border-t border-slate-100 bg-slate-50 p-4">
           <p className="text-sm text-slate-700">{item.reason}</p>
+          {item.priority_reason && (
+            <p className="mt-2 text-sm text-slate-600">
+              Ranked because of: <strong className="text-slate-800">{item.priority_reason}</strong>
+            </p>
+          )}
 
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
             <dl className="space-y-1.5 text-sm">
@@ -228,12 +289,30 @@ function RecommendationCard({ item, rank }) {
                 ['Short by', units(item.estimated_shortage)],
                 ['Cost each', money(item.unit_cost)],
                 ['Full top-up would cost', money(item.required_cost)],
+                [
+                  'Profit per unit',
+                  item.gross_profit_per_unit != null ? moneyExact(item.gross_profit_per_unit) : '—',
+                ],
+                [
+                  'Profit from this order',
+                  hasProfitData ? money(orderProfit) : '—',
+                ],
+                [
+                  'Profit potential (full 30-day forecast)',
+                  item.expected_gross_profit != null ? money(item.expected_gross_profit) : '—',
+                ],
               ].map(([label, value]) => (
                 <div key={label} className="flex justify-between gap-4">
                   <dt className="text-slate-500">{label}</dt>
                   <dd className="font-medium text-slate-800">{value}</dd>
                 </div>
               ))}
+              <p className="!mt-3 text-xs text-slate-500">
+                &ldquo;From this order&rdquo; = only the {units(item.recommended_quantity)} being
+                recommended now. &ldquo;Full 30-day forecast&rdquo; = if you stock enough to cover
+                everything you're expected to sell this month, which is what drives this
+                product's rank — not the smaller top-up amount above.
+              </p>
             </dl>
 
             <div>
@@ -242,21 +321,26 @@ function RecommendationCard({ item, rank }) {
               </p>
               <div className="space-y-2.5">
                 <Meter
-                  label="How empty the shelf is (50%)"
+                  label={`How empty the shelf is (${factorPct(weights, 'stockout_risk')}%)`}
                   value={item.stockout_risk_score}
                   tone="danger"
                 />
                 <Meter
-                  label="How fast it sells (30%)"
+                  label={`How fast it sells (${factorPct(weights, 'forecast_demand')}%)`}
                   value={item.demand_velocity_score}
                   tone="brand"
                 />
                 <Meter
-                  label="Profit per shilling spent (20%)"
+                  label="Margin efficiency (reference only — not part of the ranking)"
                   value={item.cost_efficiency_score}
                   tone="ok"
                 />
               </div>
+              <p className="mt-2 text-xs text-slate-500">
+                Expected profit ({factorPct(weights, 'expected_gross_profit')}%) and budget fit (
+                {factorPct(weights, 'affordability')}%) also factor into the score above — see the
+                tag and profit figures for how they told on this line.
+              </p>
               <p className="mt-3 rounded-lg bg-white p-2 text-center text-sm ring-1 ring-slate-200">
                 Overall score{' '}
                 <strong className="text-slate-900">{item.priority_score.toFixed(2)}</strong>
@@ -366,7 +450,7 @@ export default function Restock() {
       ) : (
         <>
           {/* ---------------- Budget summary ---------------- */}
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             <Stat label="Money available" value={money(run.budget_amount)} tone="brand" />
             <Stat
               label="Plan spends"
@@ -382,6 +466,12 @@ export default function Restock() {
                   ? `${money(run.budget_shortfall)} short`
                   : 'Budget covers everything'
               }
+            />
+            <Stat
+              label="Expected profit"
+              value={money(run.total_expected_gross_profit)}
+              tone="ok"
+              sublabel="from the quantities recommended, once sold"
             />
             <Stat
               label="Decided"
@@ -444,7 +534,12 @@ export default function Restock() {
             ) : (
               <div className="space-y-3">
                 {items.map((item) => (
-                  <RecommendationCard key={item.id} item={item} rank={item.priority_rank} />
+                  <RecommendationCard
+                    key={item.id}
+                    item={item}
+                    rank={item.priority_rank}
+                    weights={run.weights_used}
+                  />
                 ))}
               </div>
             )}
@@ -585,28 +680,34 @@ export default function Restock() {
             does not matter.
           </p>
           <p>
-            When it does not stretch, DukaSmart scores each product out of 1 on three things and
+            When it does not stretch, DukaSmart scores each product out of 1 on a few things and
             works down the list until the money runs out:
           </p>
           <ul className="space-y-2">
-            {[
-              ['50%', 'How empty the shelf is', 'How much of what you need is missing right now.'],
-              ['30%', 'How fast it sells', 'Fast movers earn the money back soonest.'],
-              [
-                '20%',
-                'Profit per shilling spent',
-                'How much margin each shilling of stock brings in.',
-              ],
-            ].map(([weight, title, description]) => (
-              <li key={title} className="flex gap-3 rounded-xl bg-slate-50 p-3 ring-1 ring-slate-200">
-                <span className="badge-info shrink-0">{weight}</span>
-                <span>
-                  <strong className="block text-slate-800">{title}</strong>
-                  <span className="text-slate-600">{description}</span>
-                </span>
-              </li>
-            ))}
+            {Object.entries(run?.weights_used || DEFAULT_WEIGHTS).map(([key, weight]) => {
+              const info = FACTOR_INFO[key] || {
+                title: key.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase()),
+                description: '',
+              }
+              return (
+                <li
+                  key={key}
+                  className="flex gap-3 rounded-xl bg-slate-50 p-3 ring-1 ring-slate-200"
+                >
+                  <span className="badge-info shrink-0">{Math.round(weight * 100)}%</span>
+                  <span>
+                    <strong className="block text-slate-800">{info.title}</strong>
+                    <span className="text-slate-600">{info.description}</span>
+                  </span>
+                </li>
+              )
+            })}
           </ul>
+          <p>
+            Each product also gets a short tag (shown on its card, e.g. &ldquo;Urgent: stockout
+            risk&rdquo; or &ldquo;High demand + high margin&rdquo;) naming whichever one or two
+            factors drove its rank the most.
+          </p>
           <p>
             If a product cannot be fully afforded, DukaSmart buys as many as the money allows and
             carries on down the list — a cheaper item further down may still fit.
